@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ihc.nix import Config
 
-FIXTURES = Path(__file__).resolve().parent / "fixtures" / "flynix"
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "example"
 NIXOS_FIXTURE = FIXTURES / "nixos"
 HM_FIXTURE = (FIXTURES / "hm").resolve()
 
@@ -32,13 +32,13 @@ def make_config(tmp_nixos: Path) -> Config:
     return Config(
         platform="nixos",
         flake_dir=tmp_nixos,
-        host_attr="flynix",
-        hm_attr="gwohl",
+        host_attr="example",
+        hm_attr="alice",
         hm_dir=HM_FIXTURE,
         impure=True,
         impure_reasons=[],
         nix_path_extra=["nixos-config=%s" % (tmp_nixos / "configuration.nix")],
-        hostname="flynix",
-        user="gwohl",
+        hostname="example",
+        user="alice",
         docs_dir=tmp_nixos,
     )

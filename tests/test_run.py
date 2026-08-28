@@ -11,14 +11,14 @@ def _cfg(docs_dir):
     return nix.Config(
         platform="nixos",
         flake_dir=docs_dir,
-        host_attr="flynix",
-        hm_attr="gwohl",
+        host_attr="example",
+        hm_attr="alice",
         hm_dir=None,
         impure=False,
         impure_reasons=[],
         nix_path_extra=[],
-        hostname="flynix",
-        user="gwohl",
+        hostname="example",
+        user="alice",
         docs_dir=docs_dir,
     )
 

@@ -1,0 +1,86 @@
+{
+  "nodes": {
+    "audio-tuning": {
+      "locked": {
+        "lastModified": 1735689600,
+        "path": "/opt/audio-tuning",
+        "type": "path"
+      },
+      "original": {
+        "path": "/opt/audio-tuning",
+        "type": "path"
+      }
+    },
+    "git-local": {
+      "locked": {
+        "lastModified": 1746057600,
+        "rev": "fedcba9876543210fedcba9876543210fedcba98",
+        "type": "git",
+        "url": "file:///opt/git-local"
+      },
+      "original": {
+        "rev": "fedcba9876543210fedcba9876543210fedcba98",
+        "type": "git",
+        "url": "file:///opt/git-local"
+      }
+    },
+    "home-manager": {
+      "locked": {
+        "lastModified": 1768003200,
+        "narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "owner": "nix-community",
+        "repo": "home-manager",
+        "rev": "1111111111111111111111111111111111111111",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "home-manager",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1768435200,
+        "narHash": "sha256-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "2222222222222222222222222222222222222222",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "pinned-tool": {
+      "locked": {
+        "lastModified": 1748736000,
+        "narHash": "sha256-CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=",
+        "owner": "example",
+        "repo": "pinned-tool",
+        "rev": "0123456789abcdef0123456789abcdef01234567",
+        "type": "github"
+      },
+      "original": {
+        "owner": "example",
+        "repo": "pinned-tool",
+        "rev": "0123456789abcdef0123456789abcdef01234567",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "audio-tuning": "audio-tuning",
+        "git-local": "git-local",
+        "home-manager": "home-manager",
+        "nixpkgs": "nixpkgs",
+        "pinned-tool": "pinned-tool"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

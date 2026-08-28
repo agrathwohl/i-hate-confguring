@@ -12,14 +12,14 @@ def _cfg(flake_dir, hm_dir):
     return nix.Config(
         platform="nixos",
         flake_dir=flake_dir,
-        host_attr="flynix",
-        hm_attr="gwohl",
+        host_attr="example",
+        hm_attr="alice",
         hm_dir=hm_dir,
         impure=True,
         impure_reasons=[],
         nix_path_extra=["nixos-config=%s" % (flake_dir / "configuration.nix")],
-        hostname="flynix",
-        user="gwohl",
+        hostname="example",
+        user="alice",
         docs_dir=flake_dir,
     )
 
@@ -89,9 +89,9 @@ class BuildCmdTests(unittest.TestCase):
 
 
 class PolicyViolationsTests(unittest.TestCase):
-    def test_disabling_musnix_is_a_violation(self):
-        diff = "+++ b/configuration.nix\n+  musnix.enable = false;\n"
-        self.assertTrue(agent.policy_violations(diff))
+    def test_disabling_a_goals_invariant_is_a_violation(self):
+        diff = "+++ b/configuration.nix\n+  security.rtkit.enable = false;\n"
+        self.assertTrue(agent.policy_violations(diff, invariants=["security.rtkit.enable"]))
 
     def test_changing_state_version_is_a_violation(self):
         diff = '+++ b/configuration.nix\n+  system.stateVersion = "23.05";\n'
@@ -102,9 +102,9 @@ class PolicyViolationsTests(unittest.TestCase):
         violations = agent.policy_violations(diff)
         self.assertTrue(any("protected file" in v for v in violations))
 
-    def test_removing_realtime_kernel_invariant_is_a_violation(self):
-        diff = "+++ b/configuration.nix\n-  musnix.kernel.realtime = true;\n"
-        self.assertTrue(agent.policy_violations(diff))
+    def test_removing_a_goals_invariant_is_a_violation(self):
+        diff = "+++ b/configuration.nix\n-  security.rtkit.enable = true;\n"
+        self.assertTrue(agent.policy_violations(diff, invariants=["security.rtkit.enable"]))
 
     def test_benign_package_addition_has_no_violation(self):
         diff = "+++ b/configuration.nix\n+    htop\n"
@@ -118,7 +118,7 @@ class FixPromptTests(unittest.TestCase):
         self.cfg = make_config(self.tmp)
 
     def test_contains_tail_roots_marker_and_flags(self):
-        prompt = agent.fix_prompt(self.cfg, ["host=flynix"], "build-system", "system", "TAIL-TEXT-HERE")
+        prompt = agent.fix_prompt(self.cfg, ["host=example"], "build-system", "system", "TAIL-TEXT-HERE")
         self.assertIn("TAIL-TEXT-HERE", prompt)
         self.assertIn(agent.DONE_MARKER, prompt)
         for repo in self.cfg.config_repos:
