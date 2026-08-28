@@ -24,9 +24,9 @@ class DecideModeTests(unittest.TestCase):
         self.assertTrue(reasons)
 
     def test_guarded_unit_restart_forces_boot(self):
-        mode, reasons = prove.decide_mode(None, Path("/nonexistent-new"), {"restart": ["jack.service"]}, ["jack.service"])
+        mode, reasons = prove.decide_mode(None, Path("/nonexistent-new"), {"restart": ["audio-daemon.service"]}, ["audio-daemon.service"])
         self.assertEqual(mode, "boot")
-        self.assertTrue(any("jack.service" in r for r in reasons))
+        self.assertTrue(any("audio-daemon.service" in r for r in reasons))
 
     def test_nothing_notable_switches(self):
         mode, reasons = prove.decide_mode(None, Path("/nonexistent-new"), {}, [])
@@ -104,25 +104,25 @@ class ActivationUnitsTests(unittest.TestCase):
     def test_parses_system_and_hm_activation_output(self):
         from ihc import prove
         text = ("stopping the following units: foo.service, bar.socket\n"
-                "restarting the following units: jack.service\n"
+                "restarting the following units: audio-daemon.service\n"
                 "starting the following units: baz.timer\n"
-                "Starting units: waybar.service mako.service\n"
-                "Restarting services: hypridle.service\n")
+                "Starting units: bar.service notifier.service\n"
+                "Restarting services: idle-daemon.service\n")
         u = prove.units_from_activation(text)
         self.assertEqual(u["stop"], ["foo.service", "bar.socket"])
-        self.assertEqual(u["restart"], ["jack.service", "hypridle.service"])
+        self.assertEqual(u["restart"], ["audio-daemon.service", "idle-daemon.service"])
         self.assertIn("baz.timer", u["start"])
-        self.assertIn("waybar.service", u["start"])
+        self.assertIn("bar.service", u["start"])
 
 
 class GenericHealthTests(unittest.TestCase):
     def test_active_units_and_ports_regressions(self):
         from ihc import prove
-        before = {"failed_units": [], "active_units": ["a.service", "jack.service"], "listening_ports": ["22", "5432"], "default_route": True, "probe:card": True}
+        before = {"failed_units": [], "active_units": ["a.service", "audio-daemon.service"], "listening_ports": ["22", "5432"], "default_route": True, "probe:card": True}
         after = {"failed_units": ["x.service"], "active_units": ["a.service"], "listening_ports": ["22"], "default_route": True, "probe:card": False}
         regs = prove.health_regressions(before, after)
         self.assertTrue(any("x.service" in r for r in regs))
-        self.assertTrue(any("jack.service" in r for r in regs))
+        self.assertTrue(any("audio-daemon.service" in r for r in regs))
         self.assertTrue(any("5432" in r for r in regs))
         self.assertTrue(any("probe:card" in r for r in regs))
         self.assertEqual(prove.health_regressions(before, before), [])
@@ -139,7 +139,7 @@ class GenericHealthTests(unittest.TestCase):
         from ihc import prove
         mode, reasons = prove.decide_mode(None, Path("/"), {"restart": ["display-manager.service"]}, [], [r"display-manager"])
         self.assertEqual(mode, "boot")
-        mode, _ = prove.decide_mode(None, Path("/"), {"restart": ["jack.service"]}, ["jack.service"], [])
+        mode, _ = prove.decide_mode(None, Path("/"), {"restart": ["audio-daemon.service"]}, ["audio-daemon.service"], [])
         self.assertEqual(mode, "boot")
-        mode, _ = prove.decide_mode(None, Path("/"), {"restart": ["foo.service"]}, ["jack.service"], [r"display-manager"])
+        mode, _ = prove.decide_mode(None, Path("/"), {"restart": ["foo.service"]}, ["audio-daemon.service"], [r"display-manager"])
         self.assertEqual(mode, "switch")

@@ -270,6 +270,15 @@ def disk() -> dict:
     return out
 
 
+def boot_entries() -> int | None:
+    """Count of bootloader entries; /boot is usually root-only, so fall back to sudo -n."""
+    d = Path("/boot/loader/entries")
+    if os.access(d, os.R_OK):
+        return len(list(d.glob("*.conf")))
+    out = _run(["sudo", "-n", "ls", str(d)], timeout=15)
+    return len([l for l in out.splitlines() if l.endswith(".conf")]) if out else None
+
+
 def timers() -> list[dict]:
     out = []
     for scope in ("--system", "--user"):
@@ -474,7 +483,7 @@ def mine(cfg: nix.Config, runtime: bool = True) -> dict:
             "hm_generations": len(hm_gens),
             "last_system_switch": datetime.fromtimestamp(cfg.system_profile.lstat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if cfg.system_profile.exists() else None,
             "last_hm_switch": datetime.fromtimestamp(cfg.hm_profile.lstat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if cfg.hm_profile.exists() else None,
-            "boot_entries": len(list(Path("/boot/loader/entries").glob("*.conf"))) if os.access("/boot/loader/entries", os.R_OK) else None,
+            "boot_entries": boot_entries(),
             "disk": disk(),
             "hardware": hardware(),
             "failed_units": failed_units(),

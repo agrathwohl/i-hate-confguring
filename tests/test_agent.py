@@ -90,8 +90,8 @@ class BuildCmdTests(unittest.TestCase):
 
 class PolicyViolationsTests(unittest.TestCase):
     def test_disabling_a_goals_invariant_is_a_violation(self):
-        diff = "+++ b/configuration.nix\n+  security.rtkit.enable = false;\n"
-        self.assertTrue(agent.policy_violations(diff, invariants=["security.rtkit.enable"]))
+        diff = "+++ b/configuration.nix\n+  services.openssh.enable = false;\n"
+        self.assertTrue(agent.policy_violations(diff, invariants=["services.openssh.enable"]))
 
     def test_changing_state_version_is_a_violation(self):
         diff = '+++ b/configuration.nix\n+  system.stateVersion = "23.05";\n'
@@ -103,8 +103,8 @@ class PolicyViolationsTests(unittest.TestCase):
         self.assertTrue(any("protected file" in v for v in violations))
 
     def test_removing_a_goals_invariant_is_a_violation(self):
-        diff = "+++ b/configuration.nix\n-  security.rtkit.enable = true;\n"
-        self.assertTrue(agent.policy_violations(diff, invariants=["security.rtkit.enable"]))
+        diff = "+++ b/configuration.nix\n-  services.openssh.enable = true;\n"
+        self.assertTrue(agent.policy_violations(diff, invariants=["services.openssh.enable"]))
 
     def test_benign_package_addition_has_no_violation(self):
         diff = "+++ b/configuration.nix\n+    htop\n"

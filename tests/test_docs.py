@@ -29,12 +29,12 @@ class CheckAllTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="ihc-docs-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         (self.tmp / "GOALS.md").write_text(
-            "Realtime kernel proven at `configuration.nix:53`.\n"
+            "State version pinned at `configuration.nix:12`.\n"
             "Bogus far pointer at configuration.nix:99999.\n"
         )
         (self.tmp / "MAINTENANCE.md").write_text(
             "Unresolved reference: nope.nix:1.\n"
-            "Blank line reference: configuration.nix:23.\n"
+            "Blank line reference: configuration.nix:13.\n"
         )
         self.cfg = _cfg(self.tmp)
 
@@ -54,8 +54,8 @@ class CheckCitationsResolutionTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         doc = tmp / "NOTES.md"
         doc.write_text(
-            "See `hardware-configuration.nix:10` for kernel params.\n"
-            "Also see `core/base.nix:5` for stateVersion.\n"
+            "See `hardware-configuration.nix:4` for kernel params.\n"
+            "Also see `core/base.nix:4` for stateVersion.\n"
         )
         problems = docs.check_citations(doc, [NIXOS_FIXTURE, HM_FIXTURE])
         self.assertEqual(problems, [])
@@ -79,11 +79,11 @@ class HostRulesTests(unittest.TestCase):
         from ihc import docs
         with tempfile.TemporaryDirectory() as tmp:
             Path(tmp, "MAINTENANCE.md").write_text(
-                "# M\n\n## Guarded units\n\n- jack.service\n- `docker.service`\n\n## Health probes\n\n"
-                "- soundcard: grep -q ExampleCard /proc/asound/cards\n- `nvidia`: `nvidia-smi -L`\n\n## Busy checks\n\n- daw: pgrep -x ardour\n\n## Queue\n\n- [ ] (risk: low) x\n")
+                "# M\n\n## Guarded units\n\n- audio-daemon.service\n- `docker.service`\n\n## Health probes\n\n"
+                "- disk: test -d /\n- `gpu`: `true`\n\n## Busy checks\n\n- render: pgrep -x example-render\n\n## Queue\n\n- [ ] (risk: low) x\n")
             r = docs.host_rules(Path(tmp))
-            self.assertEqual(r["guarded_units"], ["jack.service", "docker.service"])
-            self.assertEqual(r["health_probes"]["soundcard"], "grep -q ExampleCard /proc/asound/cards")
-            self.assertEqual(r["health_probes"]["nvidia"], "nvidia-smi -L")
-            self.assertEqual(r["busy_checks"], {"daw": "pgrep -x ardour"})
+            self.assertEqual(r["guarded_units"], ["audio-daemon.service", "docker.service"])
+            self.assertEqual(r["health_probes"]["disk"], "test -d /")
+            self.assertEqual(r["health_probes"]["gpu"], "true")
+            self.assertEqual(r["busy_checks"], {"render": "pgrep -x example-render"})
         self.assertEqual(docs.host_rules(Path("/nonexistent")), {"guarded_units": [], "health_probes": {}, "busy_checks": {}})

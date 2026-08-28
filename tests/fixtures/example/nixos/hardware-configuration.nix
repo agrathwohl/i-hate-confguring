@@ -1,9 +1,7 @@
 { config, lib, pkgs, modulesPath, ... }:
 
 {
-  boot.kernelParams = [ "threadirqs" "preempt=full" "mitigations=off" "intel_pstate=disable" ];
-
-  systemd.sleep.settings.Sleep = { AllowSuspend = "no"; AllowHibernation = "no"; };
+  boot.kernelParams = [ "quiet" ];
 
   systemd.watchdog.rebootTime = "30s";
 
