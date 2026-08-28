@@ -1,0 +1,21 @@
+[project]
+name = "ihc"
+version = "0.1.0"
+description = "i-hate-configuring: proof-first NixOS/nix-darwin + home-manager maintenance loop driven by already-authenticated agent CLIs"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+ihc = "ihc.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv]
+package = true

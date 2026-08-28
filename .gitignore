@@ -1,0 +1,15 @@
+/result
+/result-*
+__pycache__/
+*.pyc
+.venv/
+/dist/
+/build/
+*.egg-info/
+/.omc/
+/.remember/
+/.claude/settings.local.json
+/progress.txt
+/GOALS.md
+/MAINTENANCE.md
+uv.lock
