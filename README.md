@@ -143,6 +143,20 @@ Both modules also expose `package` and `randomizedDelay` (default `20m`).
    fingerprint changed since the last regeneration; write the report, append to history
    (telemetry), and send a notification.
 
+## When you are needed
+
+The run never asks. Whenever something needs you, it writes a pending decision (`ihc pending list`) and
+sends a **critical** (persistent) desktop notification titled `ACTION NEEDED — …` with the next step:
+
+- an agent CLI login is broken (`auth`);
+- an agent fix or a post-activation fix touched a protected pattern (`policy`);
+- the post-activation review found a regression the agent could not fix (`review`);
+- an input has been blocked three runs in a row (`bump`);
+- the store or `/boot` is too full to build or activate.
+
+"Reboot when convenient" (system activated in boot mode) is a normal-urgency line, not a decision.
+Resolve with `ihc pending resolve <id>` after you acted.
+
 ## Safety model
 
 - **Store pressure**: `/nix/store` free space below `IHC_MIN_STORE_FREE_GIB` (default 10 GiB)

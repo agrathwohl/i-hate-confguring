@@ -189,3 +189,39 @@ class FixLoopWritesDiffTests(unittest.TestCase):
                     v = runmod.fix_loop(cfg, run, fx, bad, 2)
                 self.assertTrue(v.ok)
                 self.assertTrue((run.dir / "fix-1.diff").exists())
+
+
+class EscalationTests(unittest.TestCase):
+    def test_third_consecutive_block_becomes_pending(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from ihc import run as runmod, store
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(store, "STATE_DIR", Path(d)), patch.object(store, "PENDING_DIR", Path(d) / "p"), patch.object(store, "HISTORY", Path(d) / "h.jsonl"), patch.object(store, "RUNS_DIR", Path(d) / "r"):
+                store.history_append({"run": "a", "blocked": ["nixpkgs"]})
+                store.history_append({"run": "b", "blocked": ["nixpkgs"]})
+                self.assertEqual(runmod.escalate_repeated_blocks({"blocked": {"nixpkgs": "boom"}}), ["nixpkgs"])
+                self.assertEqual(len(store.pending_list()), 1)
+                # already pending: not duplicated
+                self.assertEqual(runmod.escalate_repeated_blocks({"blocked": {"nixpkgs": "boom"}}), [])
+                # a fresh block (no streak) is not escalated
+                self.assertEqual(runmod.escalate_repeated_blocks({"blocked": {"stylix": "x"}}), [])
+
+
+class PruneOutlinksTests(unittest.TestCase):
+    def test_old_runs_lose_outlinks_but_keep_reports(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from ihc import store
+        with tempfile.TemporaryDirectory() as d:
+            runs = Path(d) / "runs"
+            with patch.object(store, "RUNS_DIR", runs), patch.object(store, "STATE_DIR", Path(d)), patch.object(store, "PENDING_DIR", Path(d) / "p"):
+                for i in range(5):
+                    r = runs / ("2026-0%d-run" % i); r.mkdir(parents=True)
+                    (r / "report.md").write_text("x"); (r / "system").symlink_to("/nix/store/fake-%d" % i)
+                store.prune_runs(keep=10, keep_outlinks=2)
+                have = sorted(p.name for p in runs.iterdir() if (p / "system").is_symlink())
+                self.assertEqual(have, ["2026-03-run", "2026-04-run"])
+                self.assertTrue(all((p / "report.md").exists() for p in runs.iterdir()))

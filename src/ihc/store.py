@@ -192,12 +192,20 @@ def new_run(kind: str) -> Run:
     return Run(kind=kind, id=rid, dir=d)
 
 
-def prune_runs(keep: int = KEEP_RUNS) -> None:
+KEEP_OUTLINKS = 3  # runs whose built system/home stay GC-rooted; older bundles keep only their reports
+
+
+def prune_runs(keep: int = KEEP_RUNS, keep_outlinks: int = KEEP_OUTLINKS) -> None:
     runs = sorted(p for p in RUNS_DIR.iterdir() if p.is_dir()) if RUNS_DIR.exists() else []
     for old in runs[:-keep]:
         for f in old.iterdir():
             f.unlink()
         old.rmdir()
+    for old in runs[:-keep_outlinks]:
+        for name in ("system", "hm"):
+            link = old / name
+            if link.is_symlink():
+                link.unlink()  # drops the indirect GC root; the evidence files stay
 
 
 def last_run_id() -> str | None:

@@ -274,7 +274,8 @@ def review(cfg: nix.Config, run: Run, fx: dict, kind: str, since: str, since_epo
         if violations:
             (run.dir / "review-rejected.diff").write_text(diff)
             agent.revert(cfg, run)
-            pending_add("policy", "Post-activation fix rejected by policy", "\n".join(violations), "Apply by hand if you agree, then `ihc pending resolve <id>`.")
+            pending_add("policy", "Post-activation fix rejected by policy", "\n".join(violations) + "\n\nAgent's finding: " + last[:600] + "\nDiff kept at " + str(run.dir / "review-rejected.diff"), "Apply by hand if you agree, then `ihc pending resolve <id>`.")
+            notify("ACTION NEEDED: %s regression found, fix blocked by policy" % kind, (last[:220] + " — see `ihc pending list`"), "critical")
             result["verdict"] = "BLOCKED"
             result["detail"] += " | fix rejected by policy: " + "; ".join(violations)[:200]
             return result
@@ -294,6 +295,9 @@ def review(cfg: nix.Config, run: Run, fx: dict, kind: str, since: str, since_epo
                 prove.switch_evidence(cfg, run, fx, kind + "-after-fix", store_now(), time.time() - 5, text, None)
         else:
             result["reactivated"] = "built and committed; not activated (run `ihc switch --target %s` or wait for the nightly)" % kind
+    if verdict == "BLOCKED":
+        pending_add("review", "Post-%s review: regression the agent could not fix" % kind, last[:800] + "\n\nEvidence: " + str(evidence), "Fix by hand, then `ihc pending resolve <id>`.")
+        notify("ACTION NEEDED: %s regression the agent could not fix" % kind, last[:220] + " — see `ihc pending list`", "critical")
     run.note("review %s: %s" % (kind, last[:200]))
     return result
 
@@ -371,6 +375,7 @@ def pipeline(cfg: nix.Config, run: Run, *, switch_policy: str, do_bump: bool, on
     if not prove.sudo_ok(cfg) and switch_policy in ("auto", "system-only"):
         run.note("sudo -n unavailable: system activation disabled for this run (proofs still run)")
         switch_policy = "hm-only" if switch_policy == "auto" else "never"
+    pending_before = len(pending_list())
     run.note("adopt: " + "; ".join(adopt(cfg, run, fx)))
     if prove.boot_short(fx):
         prove.prune_boot(cfg, run, fx)
@@ -409,11 +414,32 @@ def pipeline(cfg: nix.Config, run: Run, *, switch_policy: str, do_bump: bool, on
         "closure_bytes": verdict.closure_bytes, "activation": act, "generations": gens,
         "revs": {k: (v or "")[:8] for k, v in _lock_revs(cfg).items()},
     })
-    _notify_summary(verdict, bumped, act, improved, gens, run)
+    escalated = escalate_repeated_blocks(bumped) if bumped.get("blocked") else []
+    _notify_summary(verdict, bumped, act, improved, gens, run, escalated, pending_before)
     return 0 if verdict.ok and act.get("system") not in ("FAILED", "rolled back") and act.get("hm") != "FAILED" else 1
 
 
-def _notify_summary(verdict: prove.Verdict, bumped: dict, act: dict, improved: str | None, gens: int | None, run: Run) -> None:
+BLOCKED_NIGHTS = 3
+
+
+def escalate_repeated_blocks(bumped: dict) -> list[str]:
+    """An input blocked BLOCKED_NIGHTS runs in a row is beyond the agent: hand it to the user once."""
+    hist = history_read(50)
+    escalated = []
+    for name, why in bumped.get("blocked", {}).items():
+        streak = 1
+        for h in reversed(hist):
+            if name in (h.get("blocked") or []):
+                streak += 1
+            else:
+                break
+        if streak >= BLOCKED_NIGHTS and not any(p["kind"] == "bump" and name in p["title"] for p in pending_list()):
+            pending_add("bump", "Input %s blocked %d runs in a row" % (name, streak), why[:1200], "Fix the breakage by hand or pin the input, then `ihc pending resolve <id>`.")
+            escalated.append(name)
+    return escalated
+
+
+def _notify_summary(verdict: prove.Verdict, bumped: dict, act: dict, improved: str | None, gens: int | None, run: Run, escalated: list[str] | None = None, pending_before: int = 0) -> None:
     lines = []
     if bumped["bumped"]:
         lines.append("bumped: " + ", ".join(b.split(" ")[0] for b in bumped["bumped"]))
@@ -424,15 +450,26 @@ def _notify_summary(verdict: prove.Verdict, bumped: dict, act: dict, improved: s
     if act.get("hm"):
         lines.append("home-manager: " + act["hm"])
     if act.get("system"):
-        lines.append("system: %s%s" % (act["system"], " (reboot to use the new kernel/drivers)" if act.get("mode") == "boot" else ""))
+        lines.append("system: %s" % act["system"])
+        if act.get("mode") == "boot":
+            lines.append("action: reboot when convenient to run the new generation (kernel/drivers changed); the previous one stays in the boot menu")
+    blocked_reviews = []
     for k, rv in (act.get("review") or {}).items():
         lines.append("post-%s review: %s" % (k, (rv.get("verdict", "?") + " " + rv.get("detail", ""))[:160]))
+        if rv.get("verdict") == "BLOCKED":
+            blocked_reviews.append(k)
+    if escalated:
+        lines.append("action: inputs blocked %d runs in a row need you: %s" % (BLOCKED_NIGHTS, ", ".join(escalated)))
+    new_pending = len(pending_list()) - pending_before
+    if new_pending > 0:
+        lines.append("action: %d new pending decision(s) — run `ihc pending list`" % new_pending)
     if act.get("rollback"):
         lines.append("ROLLED BACK after health regression — see %s" % (run.dir / "health.json"))
     if gens is not None and gens < 2:
         lines.append("WARNING: only %d system generation kept — no rollback target. Fix generation retention (see MAINTENANCE.md)." % gens)
-    urgency = "critical" if (not verdict.ok or act.get("rollback") or act.get("system") == "FAILED" or (gens is not None and gens < 2)) else ("normal" if (bumped["bumped"] or improved or act.get("system") == "switched" or act.get("hm") == "switched") else "low")
-    title = "Maintenance %s" % ("failed at %s" % verdict.failed_step if not verdict.ok else "ok")
+    needs_user = bool(blocked_reviews or escalated or new_pending > 0)
+    urgency = "critical" if (not verdict.ok or act.get("rollback") or act.get("system") == "FAILED" or (gens is not None and gens < 2) or needs_user) else ("normal" if (bumped["bumped"] or improved or act.get("system") == "switched" or act.get("hm") == "switched") else "low")
+    title = ("ACTION NEEDED — " if needs_user else "") + "Maintenance %s" % ("failed at %s" % verdict.failed_step if not verdict.ok else "ok")
     notify(title, "\n".join(lines) or "nothing to do", urgency)
 
 

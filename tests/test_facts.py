@@ -129,3 +129,10 @@ class FingerprintTests(unittest.TestCase):
         b = {"inputs": [{"name": "nixpkgs"}], "enabled": {"system": [{"option": "services.openssh"}, {"option": "services.foo"}]}, "kernel": {"params": ["x"]}}
         self.assertEqual(facts.fingerprint(a), facts.fingerprint(a))
         self.assertNotEqual(facts.fingerprint(a), facts.fingerprint(b))
+
+
+class UnusedInputsTests(unittest.TestCase):
+    def test_inputs_not_referenced_outside_inputs_block(self):
+        text = ("{ inputs = { a.url = \"github:x/a\"; b.url = \"github:x/b\"; c = { url = \"github:x/c\"; inputs.a.follows = \"a\"; }; };\n"
+                "  outputs = { self, a, ... }@inputs: { x = a.lib; y = inputs.c.packages; }; }")
+        self.assertEqual(facts.unused_inputs(text, ["a", "b", "c"]), ["b"])

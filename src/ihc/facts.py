@@ -385,10 +385,41 @@ def fingerprint(facts: dict) -> str:
         "kernel": facts.get("kernel", {}).get("params"),
         "hw": {k: v for k, v in facts.get("runtime", {}).get("hardware", {}).items() if k in ("cpu", "gpu", "sound_cards", "kernel_running")},
         "drift": facts.get("runtime", {}).get("drift"),
+        "unused_inputs": facts.get("unused_inputs"),
+        "theming": [(h["file"], h["line"]) for h in facts.get("theming", [])][:50],
         "secrets": [(s["file"], s["line"]) for s in facts.get("secrets", [])],
         "deprecated": [(d["option"], d["file"], d["line"]) for d in facts.get("deprecated_options", [])],
     }
     return hashlib.sha256(json.dumps(keys, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def unused_inputs(flake_text: str, names: list[str]) -> list[str]:
+    """Inputs declared in flake.nix but never referenced outside the `inputs = { ... }` block."""
+    m = re.search(r"inputs\s*=\s*\{", flake_text)
+    body = flake_text
+    if m:
+        depth, i = 0, m.end() - 1
+        while i < len(flake_text):
+            depth += {"{": 1, "}": -1}.get(flake_text[i], 0)
+            if depth == 0:
+                break
+            i += 1
+        body = flake_text[:m.start()] + flake_text[i + 1:]
+    code = "\n".join(l.split("#", 1)[0] for l in body.splitlines())
+    return [n for n in names if not re.search(r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])" % re.escape(n), code)]
+
+
+def config_assets(roots: list[Path], min_mb: float = 1.0) -> list[dict]:
+    """Non-Nix files the configuration references by name (images, fonts, sounds...): they are inputs, not clutter."""
+    out = []
+    for root in roots:
+        if not root or not root.exists():
+            continue
+        texts = " ".join(p.read_text(errors="replace") for p in _nix_files(root))
+        for p in sorted(root.rglob("*")):
+            if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".ttf", ".otf", ".wav", ".ogg", ".mp3", ".flac") and p.name in texts:
+                out.append({"file": str(p), "mb": round(p.stat().st_size / 2**20, 1), "tracked": _run(["git", "-C", str(root), "ls-files", "--error-unmatch", str(p)]).strip() != ""})
+    return out
 
 
 def mine(cfg: nix.Config, runtime: bool = True) -> dict:
@@ -458,6 +489,9 @@ def mine(cfg: nix.Config, runtime: bool = True) -> dict:
         "privacy": _grep_active(sys_files + hm_files, r"(DO_NOT_TRACK|TELEMETRY|NO_ANALYTICS|telemetry_disabled|enable_metrics\s*=\s*false|searx|\btor\b|tor-browser|sops|agenix|privacy)"),
         "network": _grep_active(sys_files, r"(tailscale|openssh|mosh|networkmanager|firewall|hosts\s*=|extraHosts)"),
         "hardware_edits": _grep_active([f for f in sys_files if f.name == "hardware-configuration.nix"], r"(boot\.kernelParams|systemd\.|watchdog|sleep\.settings|enableEmergencyMode|/mnt/)"),
+        "theming": _grep_active(sys_files + hm_files, r"(stylix|base16|polarity|colorScheme|colorscheme|palette|wallpaper|\bimage\s*=|accentColor|profileName|registry\.profiles)"),
+        "unused_inputs": unused_inputs(all_text.get(str(cfg.flake_dir / "flake.nix"), ""), [i.name for i in nix.lock_inputs(cfg.flake_dir)]),
+        "config_assets": config_assets([cfg.flake_dir] + ([cfg.hm_dir] if cfg.hm_dir and cfg.hm_dir != cfg.flake_dir else [])),
         "deprecated_options": deprecated_options(sys_files + hm_files),
         "secrets": secrets_scan([cfg.flake_dir] + ([cfg.hm_dir] if cfg.hm_dir and cfg.hm_dir != cfg.flake_dir else [])),
         "dead_files": {"system": [str(f) for f in all_sys if f not in sys_files], "hm": [str(f) for f in all_hm if f not in hm_files]},
@@ -518,6 +552,11 @@ def summary_lines(facts: dict) -> list[str]:
     dr = rt.get("drift", {})
     if dr and any(dr.values()):
         lines.append("drift: %d /etc files not from the store, %d home-manager backup collisions, %d imperative profile packages" % (len(dr.get("etc_files_not_from_store", [])), len(dr.get("hm_backup_collisions", [])), len(dr.get("user_profile_packages", []))))
+    if facts.get("unused_inputs"):
+        lines.append("unused flake inputs: " + ", ".join(facts["unused_inputs"]))
+    assets = facts.get("config_assets", [])
+    if assets:
+        lines.append("config assets: %d files, %.0f MB, %d not tracked by git" % (len(assets), sum(a["mb"] for a in assets), sum(1 for a in assets if not a["tracked"])))
     hr = facts.get("host_rules", {})
     lines.append("host rules from MAINTENANCE.md: %d guarded units, %d health probes, %d busy checks" % (len(facts.get("guarded_units", [])), len(hr.get("health_probes", {})), len(hr.get("busy_checks", {}))))
     return lines
