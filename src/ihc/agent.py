@@ -15,7 +15,7 @@ from .notify import notify
 from .store import Run, pending_add
 
 DEFAULT_ORDER = ["claude", "opencode", "codex"]
-AGENT_TIMEOUT = int(os.environ.get("IHC_AGENT_TIMEOUT", "2700"))
+AGENT_TIMEOUT = int(os.environ.get("IHC_AGENT_TIMEOUT", "3600"))
 STRIP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL",
              "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CODEX_API_KEY",
              "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT")
@@ -32,8 +32,8 @@ FORBIDDEN_PATTERNS = [
     (r"security\.sudo", "sudo policy"),
     (r"services\.openssh\.enable\s*=\s*false", "ssh must stay on (remote access)"),
     (r"nix\.settings\.trusted", "nix trust settings"),
-    (r"\.url\s*=\s*\"[^\"]*(\?rev=|/[0-9a-f]{40})", "an input pinned to a commit on purpose; moving the pin is the user's call"),
 ]
+PIN_URL_RE = re.compile(r"\b([A-Za-z0-9_-]+)\.url\s*=\s*\"[^\"]*(\?rev=|/[0-9a-f]{40})")
 FORBIDDEN_FILES = [r"hardware-configuration\.nix$", r"(password|secret|token|credentials|\.env)$", r"\.age$", r"\.gpg$"]
 
 
@@ -132,7 +132,8 @@ def fix_prompt(cfg: nix.Config, facts_summary: list[str], failing_step: str, fai
 
 ## Where you may edit (and nowhere else)
 {roots}
-Absolute paths only. Do NOT edit files outside these roots. Do NOT run `nixos-rebuild switch`, `home-manager switch`, `darwin-rebuild switch`, `nix-collect-garbage`, `git push`, or anything that activates or deletes. You MAY run `nix eval`, `nix build`, `nix flake`, `home-manager build` and read anything. Useful nix flags for this tree: `{shlex.join(cfg.nix_args())}` (needed for eval/build).
+Absolute paths only. Do NOT edit files outside these roots. Do NOT run `nixos-rebuild switch`, `home-manager switch`, `darwin-rebuild switch`, `nix-collect-garbage`, `git push`, or anything that activates or deletes.
+Verify your change by EVALUATION only: `nix eval --raw '<flake>#<attr>.drvPath'` with the flags `{shlex.join(cfg.nix_args())}` (attributes: `{cfg.system_attr or "-"}` and `{cfg.hm_attr_path or "-"}`). Do NOT run `nix build` or `home-manager build` on the whole configuration — the harness builds it after you finish, and a full build here can take longer than your time budget. Building a single package to confirm a fix (`nix build nixpkgs#<pkg>`) is fine.
 
 ## System summary (mined, trust it)
 {chr(10).join('- ' + l for l in facts_summary)}
@@ -154,7 +155,7 @@ Absolute paths only. Do NOT edit files outside these roots. Do NOT run `nixos-re
 {_docs(cfg)}
 
 ## Finish
-When the build passes (verify it yourself with the flags above), print exactly one final line:
+When the evaluation passes (and, if the failure was a package build error, the single package builds), print exactly one final line:
 {DONE_MARKER} <one sentence: what you changed and why>
 If you cannot fix it safely, print exactly: {DONE_MARKER} BLOCKED <reason>
 """
@@ -194,7 +195,8 @@ def changed_files(cfg: nix.Config) -> list[str]:
         if not (repo / ".git").exists():
             continue
         subprocess.run(["git", "-C", str(repo), "add", "-A", "-N"], capture_output=True)
-        res = subprocess.run(["git", "-C", str(repo), "diff", "--name-only"], capture_output=True, text=True)
+        # against HEAD: the proof step stages the tree, so an index diff would hide the agent's edits
+        res = subprocess.run(["git", "-C", str(repo), "diff", "HEAD", "--name-only"], capture_output=True, text=True)
         out += ["%s/%s" % (repo, f) for f in res.stdout.splitlines() if f.strip()]
     return out
 
@@ -204,7 +206,7 @@ def diff_text(cfg: nix.Config) -> str:
     for repo in cfg.config_repos:
         if (repo / ".git").exists():
             subprocess.run(["git", "-C", str(repo), "add", "-A", "-N"], capture_output=True)
-            parts.append(subprocess.run(["git", "-C", str(repo), "diff"], capture_output=True, text=True).stdout)
+            parts.append(subprocess.run(["git", "-C", str(repo), "diff", "HEAD"], capture_output=True, text=True).stdout)
     return "\n".join(parts)
 
 
@@ -215,6 +217,8 @@ def policy_violations(diff: str, invariants: list[str] | None = None) -> list[st
     inv = [re.escape(o) for o in (invariants or [])]
     inv_off = re.compile(r"(%s)\s*=\s*(false|no|0)\b" % "|".join(inv)) if inv else None
     inv_on = re.compile(r"(%s)\s*=\s*(true|yes|1)\b" % "|".join(inv)) if inv else None
+    # moving an existing pin is the user's call; adding a pin to an unpinned input is a legitimate freeze
+    removed_pins = {m.group(1) for line in diff.splitlines() if line.startswith("-") and not line.startswith("---") for m in [PIN_URL_RE.search(line)] if m}
     for line in diff.splitlines():
         if line.startswith("+++ "):
             current_file = line[4:].strip()
@@ -227,6 +231,9 @@ def policy_violations(diff: str, invariants: list[str] | None = None) -> list[st
                     viol.append("%s: %s (%s)" % (current_file, why, line.strip()[:80]))
             if inv_off and inv_off.search(line):
                 viol.append("%s: turns off a GOALS invariant (%s)" % (current_file, line.strip()[:80]))
+            m = PIN_URL_RE.search(line)
+            if m and m.group(1) in removed_pins:
+                viol.append("%s: moves the commit pin of input %s; that is the user's call (%s)" % (current_file, m.group(1), line.strip()[:80]))
         elif line.startswith("-") and not line.startswith("---"):
             if inv_on and inv_on.search(line):
                 viol.append("%s: removes a GOALS invariant (%s)" % (current_file, line.strip()[:80]))

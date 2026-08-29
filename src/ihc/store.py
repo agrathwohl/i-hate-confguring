@@ -109,22 +109,33 @@ class Run:
         )
         t0 = time.monotonic()
         try:
-            proc = subprocess.run(
+            # own process group: a timeout must also stop whatever the command spawned (an agent's nix build)
+            proc = subprocess.Popen(
                 argv,
                 cwd=str(cwd) if cwd else None,
                 env=env,
-                input=stdin,
-                stdin=None if stdin is not None else subprocess.DEVNULL,  # agent CLIs read a non-TTY stdin until EOF
-                capture_output=True,
+                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 errors="replace",
+                start_new_session=True,
             )
-            code, out, err = proc.returncode, proc.stdout, proc.stderr
-        except subprocess.TimeoutExpired as exc:
-            code = 124
-            out = (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            err = ((exc.stderr or b"").decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")) + "\nihc: timeout after %ss" % timeout
+            try:
+                out, err = proc.communicate(input=stdin, timeout=timeout)
+                code = proc.returncode
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, 15)
+                    out, err = proc.communicate(timeout=20)
+                except (subprocess.TimeoutExpired, ProcessLookupError):
+                    try:
+                        os.killpg(proc.pid, 9)
+                    except ProcessLookupError:
+                        pass
+                    out, err = proc.communicate()
+                code = 124
+                err = (err or "") + "\nihc: timeout after %ss (process group killed)" % timeout
         except FileNotFoundError as exc:
             code, out, err = 127, "", "ihc: %s" % exc
         seconds = time.monotonic() - t0

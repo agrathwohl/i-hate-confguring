@@ -110,7 +110,7 @@ def fix_loop(cfg: nix.Config, run: Run, fx: dict, verdict: prove.Verdict, max_at
         diff = agent.diff_text(cfg)
         violations = agent.policy_violations(diff, docs.invariant_options(cfg.docs_dir))
         if violations:
-            (run.dir / "rejected-%d.diff" % attempt).write_text(diff)
+            (run.dir / ("rejected-%d.diff" % attempt)).write_text(diff)
             agent.revert(cfg, run)
             pending_add("policy", "Agent change rejected by policy", "\n".join(violations) + "\n\nDiff kept at %s" % (run.dir / ("rejected-%d.diff" % attempt)), "Apply the change by hand if you agree, then `ihc pending resolve <id>`.")
             notify("Agent change rejected", "; ".join(violations)[:300], "critical")
@@ -121,7 +121,7 @@ def fix_loop(cfg: nix.Config, run: Run, fx: dict, verdict: prove.Verdict, max_at
             if last.startswith("BLOCKED"):
                 break
             continue
-        (run.dir / "fix-%d.diff" % attempt).write_text(diff)
+        (run.dir / ("fix-%d.diff" % attempt)).write_text(diff)
         verdict = prove.check(cfg, run, fx, target, eval_only)
         if verdict.ok:
             run.note("fixed by %s on attempt %d: %s" % (name, attempt, last[:200]))

@@ -106,6 +106,7 @@
 
               Service = {
                 Type = "oneshot";
+            SuccessExitStatus = "75";  # another ihc run held the lock: skip, not a failure
                 ExecStart = execStart cfg;
                 Nice = 19;
                 IOSchedulingClass = "idle";
@@ -197,6 +198,7 @@
 
               serviceConfig = {
                 Type = "oneshot";
+            SuccessExitStatus = "75";
                 User = cfg.user;
                 ExecStart = execStart cfg;
                 Nice = 19;

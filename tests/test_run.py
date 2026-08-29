@@ -167,3 +167,25 @@ class RevertIsHeadRelativeTests(unittest.TestCase):
                 agent.revert(cfg, run)
             self.assertEqual((repo / "flake.lock").read_text(), "good")
             self.assertFalse((repo / "new.nix").exists())
+
+
+class FixLoopWritesDiffTests(unittest.TestCase):
+    def test_fix_loop_records_diff_and_returns_ok_verdict(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from ihc import agent, nix, prove, run as runmod, store
+        with tempfile.TemporaryDirectory() as d:
+            cfg = nix.Config("nixos", Path(d), "h", None, None, True, [], [], "h", "u", Path(d))
+            with patch.object(store, "RUNS_DIR", Path(d) / "runs"), patch.object(store, "STATE_DIR", Path(d)), patch.object(store, "PENDING_DIR", Path(d) / "p"):
+                run = store.new_run("t")
+                bad = prove.Verdict(ok=False, failed_step="build-hm", failed_target="hm")
+                good = prove.Verdict(ok=True)
+                with patch.object(agent, "run_agent", return_value=("claude", True, "IHC-DONE: x")), \
+                     patch.object(agent, "diff_text", return_value="+++ b/x.nix\n+ foo = 1;\n"), \
+                     patch.object(agent, "changed_files", return_value=["x.nix"]), \
+                     patch.object(prove, "check", return_value=good):
+                    fx = {"host": "h", "platform": "nixos", "config": {"flake_dir": d, "host_attr": "h", "hm_attr": None, "impure": True, "nix_args": []}}
+                    v = runmod.fix_loop(cfg, run, fx, bad, 2)
+                self.assertTrue(v.ok)
+                self.assertTrue((run.dir / "fix-1.diff").exists())

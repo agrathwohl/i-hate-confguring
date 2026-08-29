@@ -29,7 +29,13 @@ class PinPolicyTests(unittest.TestCase):
         from ihc import agent
         diff = ('+++ b/flake.nix\n-    x.url = "git+file:///r?rev=606418c4d5bc547b57b66d42abcb6b26511233cb";\n'
                 '+    x.url = "git+file:///r?rev=64d410666821866c565e048a4d07d6cf5d8e494e";\n')
-        self.assertTrue(any("pinned" in v for v in agent.policy_violations(diff)))
+        self.assertTrue(any("pin" in v for v in agent.policy_violations(diff)))
+
+    def test_adding_a_pin_to_an_unpinned_input_is_allowed(self):
+        from ihc import agent
+        diff = ('+++ b/flake.nix\n-    x.url = "github:a/b";\n'
+                '+    x.url = "github:a/b/0123456789abcdef0123456789abcdef01234567";\n')
+        self.assertEqual(agent.policy_violations(diff), [])
 
     def test_unpinned_url_change_is_fine(self):
         from ihc import agent

@@ -13,3 +13,4 @@ __pycache__/
 /GOALS.md
 /MAINTENANCE.md
 uv.lock
+/.omo/
