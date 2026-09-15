@@ -116,6 +116,18 @@ class PolicyViolationsTests(unittest.TestCase):
         diff = "+++ b/configuration.nix\n+    htop\n"
         self.assertEqual(agent.policy_violations(diff), [])
 
+    def test_widening_the_insecure_package_gate_is_a_violation(self):
+        """The cheapest way to make eval pass again after a permittedInsecurePackages edit is a blanket
+        override, which is itself a high-severity security finding."""
+        for line in ("+  nixpkgs.config.allowInsecure = true;",
+                     "+  nixpkgs.config.allowInsecurePredicate = p: true;"):
+            diff = "+++ b/configuration.nix\n%s\n" % line
+            self.assertTrue(any("insecure-package gating" in v for v in agent.policy_violations(diff)), line)
+
+    def test_a_permitted_insecure_packages_list_is_not_itself_a_violation(self):
+        diff = '+++ b/configuration.nix\n+  nixpkgs.config.permittedInsecurePackages = [ "olm-3.2.16" ];\n'
+        self.assertEqual(agent.policy_violations(diff), [])
+
 
 class FixPromptTests(unittest.TestCase):
     def setUp(self):
@@ -146,3 +158,47 @@ class AvailableTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AskPromptTests(unittest.TestCase):
+    def test_contains_question_rules_and_all_three_verdict_markers(self):
+        from ihc import agent, nix
+        from pathlib import Path
+        cfg = nix.Config("nixos", Path("/tmp/x"), "h", "u", None, True, [], [], "h", "u", Path("/tmp/x"))
+        p = agent.ask_prompt(cfg, ["fact one"], "the calendar in my bar never updates the day")
+        self.assertIn("the calendar in my bar never updates the day", p)
+        self.assertIn("fact one", p)
+        for w in ("IHC-DONE: FIXED", "IHC-DONE: BLOCKED", "IHC-DONE: UNSOLVED"):
+            self.assertIn(w, p)
+        self.assertIn("journalctl", p)
+
+
+class LimitedProbeTests(unittest.TestCase):
+    def test_limit_messages_are_not_logged_out(self):
+        from ihc import agent
+        for w in ("You've hit your session limit · resets 3:30am (America/Chicago)",
+                  "Rate limited, try again at 14:00", "usage limit reached"):
+            self.assertTrue(agent.limited(w), w)
+        for w in ("Not logged in", "ERROR: Your access token could not be refreshed", "}"):
+            self.assertFalse(agent.limited(w), w)
+
+    def test_run_agent_reports_limit_without_auth_pending(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from ihc import agent, nix, store
+        with tempfile.TemporaryDirectory() as d:
+            cfg = nix.Config("nixos", Path(d), "h", "u", None, True, [], [], "h", "u", Path(d))
+            calls = []
+            with patch.object(store, "RUNS_DIR", Path(d) / "runs"), patch.object(store, "STATE_DIR", Path(d)), patch.object(store, "PENDING_DIR", Path(d) / "p"), \
+                 patch.object(agent, "available", lambda o, c: []), \
+                 patch.object(agent, "LAST_PROBE", {"claude": "hit your session limit · resets 3:30am"}), \
+                 patch.object(agent, "pending_add", lambda *a, **k: calls.append(("pending", a))), \
+                 patch.object(agent, "notify", lambda *a, **k: calls.append(("notify", a))):
+                run = store.new_run("t")
+                name, ok, last = agent.run_agent(cfg, run, "x")
+        self.assertIsNone(name)
+        self.assertIn("usage-limited", last)
+        kinds = [c[0] for c in calls]
+        self.assertNotIn("pending", kinds)
+        self.assertEqual(calls[0][1][0], "Agent usage limit hit")

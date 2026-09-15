@@ -5,9 +5,11 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -19,6 +21,134 @@ RUNS_DIR = STATE_DIR / "runs"
 PENDING_DIR = STATE_DIR / "pending"
 HISTORY = STATE_DIR / "history.jsonl"
 KEEP_RUNS = 30
+VERBOSE = os.environ.get("IHC_VERBOSE") == "1"  # stream every command's output to stderr (`ihc -v`)
+_LOG_PREFIX = re.compile(r"^([A-Za-z0-9][A-Za-z0-9+._-]*)> ")  # `nix build -L` prefixes each line with the derivation name
+
+
+def _pump(pipe, buf: list[str], timing: dict[str, tuple[float, float]]) -> None:
+    for line in pipe:
+        buf.append(line)
+        m = _LOG_PREFIX.match(line)
+        if m:
+            t = time.monotonic()
+            timing[m.group(1)] = (timing.get(m.group(1), (t, t))[0], t)
+        if VERBOSE:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+    pipe.close()
+
+
+def _feed(pipe, text: str) -> None:
+    try:
+        pipe.write(text)
+    except BrokenPipeError:
+        pass
+    finally:
+        pipe.close()
+
+
+# ---- build-cost ledger: how long each derivation took to build locally (no binary cache had it) ----
+
+def ledger_read() -> dict:
+    try:
+        return json.loads((STATE_DIR / "build-ledger.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def ledger_update(seconds: dict[str, float], run_id: str) -> None:
+    data = ledger_read()
+    for name, secs in seconds.items():
+        if secs >= 1:
+            data[name] = {"seconds": int(secs), "run": run_id, "at": now_iso()}
+    if data:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        (STATE_DIR / "build-ledger.json").write_text(json.dumps(data, indent=2, sort_keys=True))
+
+
+def ledger_top(n: int = 5) -> list[list]:
+    items = sorted(ledger_read().items(), key=lambda kv: -kv[1]["seconds"])
+    return [[name, v["seconds"]] for name, v in items[:n]]
+
+
+# ---- security auto-fix gate: a finding is never fixed the run it first appears, and a failed fix is not retried nightly ----
+
+SECURITY_STATE = STATE_DIR / "security-state.json"
+
+
+def _sec_state() -> dict:
+    try:
+        return json.loads(SECURITY_STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _sec_write(data: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    SECURITY_STATE.write_text(json.dumps(data, indent=2, sort_keys=True))
+
+
+def _age_days(stamp: str) -> int:
+    try:
+        then = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return 0
+    return (datetime.now(timezone.utc) - then).days
+
+
+def security_due(key: str, grace_days: int, backoff_days: int) -> tuple[bool, str]:
+    """May ihc fix this finding automatically now? Records the sighting as a side effect.
+
+    Never the first time it is seen: the user gets one notification to record it under
+    `## Security exceptions` first. Never within backoff_days of a failed attempt.
+    """
+    data = _sec_state()
+    entry = data.get(key)
+    if entry is None:
+        data[key] = {"first_seen": now_iso(), "attempts": 0, "last_attempt": None}
+        _sec_write(data)
+        return False, "first sighting; ihc fixes it on the next run unless you except it"
+    last = entry.get("last_attempt")
+    if last and _age_days(last) < backoff_days:
+        return False, "a fix failed %d day(s) ago; not retried for %d" % (_age_days(last), backoff_days)
+    if _age_days(entry.get("first_seen", now_iso())) < grace_days:
+        return False, "seen %d day(s) ago; fixed once it is %d" % (_age_days(entry.get("first_seen", now_iso())), grace_days)
+    return True, ""
+
+
+def security_attempted(key: str, ok: bool) -> None:
+    data = _sec_state()
+    entry = data.setdefault(key, {"first_seen": now_iso(), "attempts": 0, "last_attempt": None})
+    entry["attempts"] = int(entry.get("attempts", 0)) + 1
+    entry["last_attempt"] = now_iso()
+    entry["outcome"] = "fixed" if ok else "failed"
+    _sec_write(data)
+
+
+def heavy_deferred(name: str) -> int:
+    """Days since a heavy bump of this input was first deferred (0 the first time)."""
+    path = STATE_DIR / "heavy-bumps.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        data = {}
+    if name not in data:
+        data[name] = now_iso()
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2))
+        return 0
+    since = datetime.strptime(data[name], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - since).days
+
+
+def heavy_clear(name: str) -> None:
+    path = STATE_DIR / "heavy-bumps.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    if data.pop(name, None) is not None:
+        path.write_text(json.dumps(data, indent=2))
 
 
 def now_iso() -> str:
@@ -89,6 +219,7 @@ class Run:
         self.notes.append("%s %s" % (now_iso(), text))
         with open(self.dir / "notes.log", "a") as fh:
             fh.write(self.notes[-1] + "\n")
+        print("ihc: " + text, file=sys.stderr, flush=True)
 
     def step(
         self,
@@ -107,7 +238,10 @@ class Run:
         base.with_suffix(".cmd").write_text(
             "cd %s\n%s\n" % (shlex.quote(str(cwd or os.getcwd())), shlex.join(argv))
         )
+        print("ihc: [%02d] %s ..." % (idx, name), file=sys.stderr, flush=True)
         t0 = time.monotonic()
+        bufs: tuple[list[str], list[str]] = ([], [])
+        timing: dict[str, tuple[float, float]] = {}
         try:
             # own process group: a timeout must also stop whatever the command spawned (an agent's nix build)
             proc = subprocess.Popen(
@@ -121,22 +255,33 @@ class Run:
                 errors="replace",
                 start_new_session=True,
             )
+            pumps = [threading.Thread(target=_pump, args=(proc.stdout, bufs[0], timing), daemon=True),
+                     threading.Thread(target=_pump, args=(proc.stderr, bufs[1], timing), daemon=True)]
+            for th in pumps:
+                th.start()
+            if stdin is not None:
+                threading.Thread(target=_feed, args=(proc.stdin, stdin), daemon=True).start()
+            timed_out = False
             try:
-                out, err = proc.communicate(input=stdin, timeout=timeout)
-                code = proc.returncode
+                code = proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
+                timed_out = True
                 try:
                     os.killpg(proc.pid, 15)
-                    out, err = proc.communicate(timeout=20)
+                    proc.wait(timeout=20)
                 except (subprocess.TimeoutExpired, ProcessLookupError):
                     try:
                         os.killpg(proc.pid, 9)
                     except ProcessLookupError:
                         pass
-                    out, err = proc.communicate()
+                    proc.wait()
                 code = 124
-                err = (err or "") + "\nihc: timeout after %ss (process group killed)" % timeout
-        except FileNotFoundError as exc:
+            for th in pumps:
+                th.join(timeout=5)
+            out, err = "".join(bufs[0]), "".join(bufs[1])
+            if timed_out:
+                err += "\nihc: timeout after %ss (process group killed)" % timeout
+        except OSError as exc:  # not only FileNotFoundError: a non-executable or unreachable binary raises PermissionError
             code, out, err = 127, "", "ihc: %s" % exc
         seconds = time.monotonic() - t0
         base.with_suffix(".out").write_text(out)
@@ -144,6 +289,11 @@ class Run:
         base.with_suffix(".exit").write_text("%d\n" % code)
         step = Step(name, argv, code, out, err, seconds, str(cwd) if cwd else None)
         self.steps.append(step)
+        if name.startswith("build-") and timing:
+            ledger_update({n: b - a for n, (a, b) in timing.items()}, self.id)
+        status = "ok" if code == 0 else "exit %d" % code
+        print("ihc: [%02d] %s: %s (%.0fs)%s" % (idx, name, status, seconds, "" if code == 0 else " -- " + step.tail(1).strip()[:200]),
+              file=sys.stderr, flush=True)
         return step
 
     def report(self) -> dict:

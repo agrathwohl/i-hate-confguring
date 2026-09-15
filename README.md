@@ -101,6 +101,8 @@ Both modules also expose `package` and `randomizedDelay` (default `20m`).
 | `IHC_MIN_STORE_FREE_GIB` | `/nix/store` free-space floor before builds are refused | `10` |
 | `IHC_GUARDED_UNITS` | comma-separated unit names added to the guarded-units list | (unset) |
 | `IHC_NO_DESKTOP` | set to skip desktop notifications (still logged + printed to stderr) | (unset) |
+| `IHC_CVE_DAYS` | days between nightly CVE scans; `0` disables them | `7` |
+| `IHC_CVE_TIMEOUT` | seconds before a CVE scan is killed | `2400` |
 
 ## Verbs
 
@@ -118,6 +120,7 @@ Both modules also expose `package` and `randomizedDelay` (default `20m`).
 | `docs check\|regen` | `--dir PATH` | check `GOALS.md`/`MAINTENANCE.md` citations, or regenerate them with an agent (unconditionally) |
 | `notify` | `TITLE [BODY]`, `-u/--urgency`, `-q/--quiet` | send a desktop notification (and log it) |
 | `pending list\|resolve` | `[ID]` | decisions that need you |
+| `security` | `--json`, `--fix`, `--cve`, `--max-attempts N` | what grants privilege, exposes a credential, or is known-vulnerable; `--fix` pins unhashed remote fetches (the one class ihc will hand to an agent, and only when you ask), `--cve` for a vulnix closure scan |
 | `mcp` | | serve a subset of the verbs over MCP stdio |
 
 `--flake DIR` is a global flag on every verb (default: `$IHC_FLAKE` or autodetect).
@@ -139,7 +142,11 @@ Both modules also expose `package` and `randomizedDelay` (default `20m`).
    an agent reviews it — what changed, unit/journal state, program checks — fixes a real
    regression, re-proves, and re-activates home-manager (a system-side fix is proved but left
    for the next run to activate).
-8. Record the system generation count; regenerate `GOALS.md`/`MAINTENANCE.md` if the mined-facts
+8. Run the security report against the final tree, write it to `<run>/security.json`, and raise one
+   pending decision if the set of high-severity findings changed. The run never edits anything
+   security-related — not even the auto-remediable class — so a rolling channel it flagged cannot be
+   pinned behind your back. A CVE scan runs here at most every `IHC_CVE_DAYS` days.
+9. Record the system generation count; regenerate `GOALS.md`/`MAINTENANCE.md` if the mined-facts
    fingerprint changed since the last regeneration; write the report, append to history
    (telemetry), and send a notification.
 
@@ -189,11 +196,36 @@ Resolve with `ihc pending resolve <id>` after you acted.
   by hand.
 - **Never**: `git push`, garbage collection (`nix-collect-garbage`, `nh clean`), or a reboot.
 
+## Ask
+
+`ihc ask "the calendar popup in my bar never updates the day"` — describe a problem in your own
+words. The agent gets the mined system facts and both config trees, reads the generated files and
+the journals to find the root cause, and fixes it with the smallest change it can. The harness
+then proves the tree (eval, build), rejects policy breaks, commits on success, and reverts on
+failure. The answer is one of three honest verdicts: `FIXED` (what and why, committed, applied at
+the next activation), `BLOCKED` (cause found, why it cannot be fixed from the config), or
+`UNSOLVED` (what was checked and ruled out). Also available as the `ask` MCP tool.
+
+## Heavy builds
+
+A bump of `nixpkgs` rebuilds from source every package no configured binary cache has (CUDA
+variants, packages pinned to a commit, overrides). `ihc` measures that cost instead of paying it
+every night: the `-L` build log it already captures gives per-derivation build time, kept in
+`~/.local/state/ihc/build-ledger.json`. Before it proves a bump it runs `nix build --dry-run`;
+when the local builds that bump forces add up to more than `IHC_HEAVY_MINUTES` (20) of known
+cost, the bump is deferred, the lock restored, the notification and `ihc status` name the package
+and its cost, and MAINTENANCE.md's queue gets an item for the agent: give the package its own
+slow-moving input and take it from there, so `nixpkgs` moves daily while ihc bumps the slow input
+every `IHC_HEAVY_DAYS` (7) days. Any input is allowed a heavy bump once its deferral is that old;
+`ihc run --allow-heavy` / `ihc bump --allow-heavy` force one now.
+
 ## Drift
 
 `ihc` commits whatever a human changed directly in the config repos before it starts work and
 after every change it makes itself, so every diff it produces is isolated and revertible without
-touching what you did by hand. Separately, `ihc facts` / `ihc status` report *imperative* drift
+touching what you did by hand. If `flake.lock` is part of that drift (a `nix flake update` you ran,
+or a bump a crashed run left behind), the commit message and the run notes name the inputs that moved.
+Separately, `ihc facts` / `ihc status` report *imperative* drift
 the configuration doesn't manage: regular `/etc` files where the current generation expects a
 store symlink, home-manager backup files (`*.ihc-bak` and whatever `backupFileExtension` your
 config sets) left behind by a conflicting activation, and packages sitting in the user's
@@ -202,12 +234,145 @@ findings and queues adopting or removing them. A local (`path:`/`git+file:`) inp
 content no longer matches `flake.lock` is detected from the resulting eval/build error and
 re-locked automatically.
 
+## Aesthetics
+
+If the configuration has a theming source of truth — stylix, base16 references, nix-colors,
+catppuccin, or a profile registry (an attribute set of profiles with an `image`) — `ihc`
+treats a consistent look as a correctness property:
+
+- `ihc aesthetics` reports the sources found, the palette (from the generation's
+  `.config/stylix/palette.json` or the config's `colorScheme`/`base16Scheme`), every profile
+  (missing fields, missing image), and every enabled surface: terminals, shells, tmux,
+  editors, window managers, bars, launchers, notifiers, lock screens, GTK/Qt, browser, cursor,
+  fonts. For each surface it says whether the source config derives from the palette
+  (`themed`/`hardcoded`) and whether the *generated* file in the active or a built generation
+  contains colours outside the palette (`consistent`/`drift`/`not_generated`).
+- `ihc aesthetics --fix` hands the drift to the agent (make the surface derive from the
+  palette in the config trees, never by editing generated files) and proves the result.
+- The post-activation review of home-manager includes the same scan of the new generation.
+- Extend the surface table per host in MAINTENANCE.md: `## Aesthetic surfaces` with
+  `- <label>: <path relative to $HOME>` bullets.
+
+## Security
+
+`ihc security` answers one question: what in this configuration grants privilege, exposes a credential,
+or ships a package that is known to be vulnerable?
+
+It has two independent sources of evidence and says which one each finding came from.
+
+- **Your files.** Every finding that comes from a grep carries a real `path:line` in your config trees,
+  and comment-stripped: a commented-out `networking.firewall.enable = false;` is not a finding.
+- **The effective values.** One batched `nix eval` reads what your configuration actually resolves to,
+  including nixpkgs' own defaults. This is the half that matters: on a stock NixOS host
+  `services.openssh.settings.PasswordAuthentication` is `true` because that is nixpkgs' default, and the
+  string appears nowhere in your files. A grep-only tool reports nothing there.
+  If that evaluation fails (a `path:` input whose checkout moved, a broken module), ihc prints the real
+  nix error and marks those checks **unknown**. It never shows you a shorter list and calls it clean.
+
+What it checks: password and root ssh login, the firewall being off, passwordless sudo for wheel,
+`nix trusted-users` beyond root, `require-sigs` off, `accept-flake-config` on, users in a group that is
+root-equivalent on this machine (docker/lxd/incus/libvirt, only when that daemon is actually enabled),
+inline account passwords, autologin, `permittedInsecurePackages` and blanket insecure overrides,
+remote fetches with no hash, credential literals in files that are part of the built configuration
+(they end up world-readable in `/nix/store`) versus in files nothing imports, a home-manager ssh
+client that has turned off host-key checking or turned on agent forwarding, and how old the nixpkgs
+you pin and run actually is (medium past 45 days, high past 180; silent below that, so a host whose
+nightly is working never sees it).
+
+### What gets fixed and what does not
+
+Exactly one class of finding is ever handed to an agent, by `ihc security --fix` and by the nightly:
+
+- an unhashed `builtins.fetchTarball` / `fetchurl` / `fetchGit`, pinned to the content it already
+  resolves to today, so a rebuild cannot silently execute different code. It runs under the normal
+  proof harness (evaluate, build, dry-activate, closure diff) and is revertible; if the fix does not
+  prove, the harness reverts it and the finding stays reported.
+
+Everything else — ssh, the firewall, sudo, users, groups, secrets wiring, an insecure-package permit —
+is reported and raises a pending decision, and is never edited for you. Those are the changes that can
+lock you out of your own machine or quietly undo something you meant, so they stay yours to make.
+
+Three gates stand between a finding and an unattended fix, because a rolling fetch is often deliberate
+(a NUR-style overlay, a channel tarball):
+
+1. **Never on first sight.** A new finding is reported and held for one run. You get a notification
+   naming it before anything is touched.
+2. **Exceptions win.** Anything listed under `## Security exceptions` in MAINTENANCE.md is neither
+   fixed nor reported nor escalated. That is where a deliberately rolling fetch goes.
+3. **A failed fix is not retried.** If the proof fails, the harness reverts, and ihc does not try that
+   finding again for 30 days (`IHC_SECURITY_BACKOFF_DAYS`); the finding stays reported meanwhile. The
+   grace period is `IHC_SECURITY_GRACE_DAYS`, one run by default.
+
+The agent only ever sees findings the check table marks auto, never a file the agent policy protects,
+and never one you have accepted.
+
+`permittedInsecurePackages` entries are reported, one per entry with the line that permits it, and
+never deleted for you. Whether an entry is still needed is not something ihc can know: nothing here
+compares it against nixpkgs or the lock, and deleting a live one stops the whole tree evaluating.
+
+Everything else is a decision, not a defect. Turning the firewall on drops every port you did not
+enumerate. Disabling password auth without a working key is a permanent lockout. Removing someone from
+the docker group breaks their containers. So ihc reports those, and raises **one** pending decision
+listing the high-severity ones (`ihc pending list`). It does not raise it again unless the set changes.
+
+### Accepting a finding
+
+Record what you have decided to live with in `MAINTENANCE.md`:
+
+    ## Security exceptions
+
+    - sudo_passwordless_wheel: single-user laptop, full-disk encrypted
+    - unpinned_remote_fetch: a NUR-style overlay I float on purpose
+
+Ids come from `ihc security --json`. An accepted finding still shows up, marked accepted with your
+reason — it just stops counting, stops escalating, and is never handed to the agent.
+
+### CVE scanning
+
+`ihc security --cve` scans the runtime closure for published vulnerabilities. It tries scanners in
+order and reports which one answered:
+
+1. [vulnxscan](https://github.com/tiiuae/sbomnix) (from `sbomnix`), which queries live OSV and grype
+   data. This is the default because it works today.
+2. [vulnix](https://github.com/nix-community/vulnix), kept as a fallback. Be aware that vulnix
+   downloads NIST's legacy NVD JSON feeds, and NIST has retired them: those URLs now answer 401/404,
+   so on a cold cache vulnix cannot build a database at all. ihc reports that failure with the real
+   error rather than an empty list.
+
+Either way ihc runs the scanner as a subprocess — from `PATH`, else from your own locked nixpkgs via
+`nix shell --inputs-from`, else from the registry. The nightly run scans at most every `IHC_CVE_DAYS`
+days (default 7) and skips it when the store is short on space or the run is out of time. It is not
+nightly on purpose: a full closure scan takes many minutes and needs the network, so on a laptop that
+wakes without one it simply fails, and a failure is reported as a failure.
+
+Read the result as a triage order, not a verdict, and ihc says so in every report: a scanner matches
+on package name and version, so a package that merely shares a name with something else inherits its
+CVEs; a CVE with no score is reported as unscored, never as 0.0; and it scans what was built, not
+necessarily what is running — ihc lists the exact store paths it scanned. It also reports how many
+paths in the closure still have a deriver: if derivations have been garbage-collected, a scanner skips
+those paths silently, and a "clean" scan would be a lie.
+
+## Hygiene
+
+`ihc` keeps its own footprint small (evidence bundles: newest 30 kept, and only the newest 3
+keep the built system/home out-links that pin closures) and mines the rest for the docs:
+generation retention, unused flake inputs, commit-pinned inputs, local inputs whose content
+changed, configuration assets outside git, stale backup files, dead configuration files, and
+`/boot` pressure (it re-installs the bootloader to drop entries of deleted generations). It
+never garbage-collects, deletes profiles, or touches user data; those become queue items
+with a recommended command. MAINTENANCE.md's "System hygiene" section is the method the
+agent maintains for the host.
+
 ## Evidence bundles
 
 Every run writes `~/.local/state/ihc/runs/<id>/` (override the base with `IHC_STATE_DIR`),
 pruned to the most recent 30:
 
 - `report.md`, `report.json` — the verdict and a table of every step; `notes.log` — narration.
+
+While a run works, every note and every step start/finish is printed to stderr (`ihc: [09] build-system ...`),
+so an interactive run and the journal both show progress; `ihc -v <verb>` (or `IHC_VERBOSE=1`) streams the full
+command output too. The run directory keeps it either way.
 - `NN-name.{cmd,out,err,exit}` — one set per command run.
 - `system-diff.txt`, `hm-diff.txt` — closure diffs; `facts.json` — the mined facts for the run.
 - `fix-N.diff`, `rejected-N.diff`, `review-fix.diff`, `review-rejected.diff` — agent diffs,

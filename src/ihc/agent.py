@@ -32,6 +32,7 @@ FORBIDDEN_PATTERNS = [
     (r"security\.sudo", "sudo policy"),
     (r"services\.openssh\.enable\s*=\s*false", "ssh must stay on (remote access)"),
     (r"nix\.settings\.trusted", "nix trust settings"),
+    (r"allowInsecure", "insecure-package gating"),
 ]
 PIN_URL_RE = re.compile(r"\b([A-Za-z0-9_-]+)\.url\s*=\s*\"[^\"]*(\?rev=|/[0-9a-f]{40})")
 FORBIDDEN_FILES = [r"hardware-configuration\.nix$", r"(password|secret|token|credentials|\.env)$", r"\.age$", r"\.gpg$"]
@@ -48,6 +49,12 @@ PROBE_PROMPT = "Reply with exactly: IHC-DONE: hello"
 PROBE_TIMEOUT = int(os.environ.get("IHC_PROBE_TIMEOUT", "180"))
 RELOGIN = {"claude": "run `claude` and type /login", "codex": "run `codex login`", "opencode": "run `opencode auth login`"}
 LAST_PROBE: dict[str, str] = {}
+LIMIT_RE = re.compile(r"session limit|usage limit|rate.?limit(ed)?|quota|resets \d|try again (at|in)", re.I)
+
+
+def limited(why: str) -> bool:
+    """A usage-limited CLI is logged in; it just cannot answer right now."""
+    return bool(LIMIT_RE.search(why))
 _PROBED: dict[str, list[dict]] = {}  # per process: one live probe round per flake, not one per fix attempt
 
 
@@ -161,6 +168,43 @@ If you cannot fix it safely, print exactly: {DONE_MARKER} BLOCKED <reason>
 """
 
 
+def ask_prompt(cfg: nix.Config, facts_summary: list[str], question: str) -> str:
+    roots = "\n".join("- %s" % r for r in cfg.config_repos)
+    return f"""You are ihc, an unattended maintenance agent for a Nix configuration. A user reported a problem in their own words. Nobody will answer questions: investigate, decide, act, report.
+
+## The user's problem (verbatim)
+{question}
+
+## Investigate before you edit
+- Find which component the user means: read the config trees below, the generated files the active generations link into the home directory, and the unit journals (`journalctl --user -u <unit> -n 200`, `journalctl -u <unit> -n 200`).
+- Reproduce or observe the fault where possible (read the generated config the running program uses, not only the source).
+- Name the root cause explicitly in your final line.
+
+## Where you may edit (and nowhere else)
+{roots}
+Absolute paths only. Do NOT edit files outside these roots (a generated file in the Nix store cannot be edited — fix its source). Do NOT run `nixos-rebuild switch`, `home-manager switch`, `darwin-rebuild switch`, or garbage collection.
+Verify your change by EVALUATION only: `nix eval --raw '<flake>#<attr>.drvPath'` with the flags `{shlex.join(cfg.nix_args())}` (attributes: `{cfg.system_attr or "-"}`, `{cfg.hm_attr_path or "-"}`). The harness builds and commits after you; your fix reaches the desktop at the next activation.
+
+## System summary (mined, trust it)
+{chr(10).join('- ' + l for l in facts_summary)}
+
+## Hard rules (a policy check reverts your diff if you break these)
+- Never change stateVersion, filesystems, bootloader, swap, users, sudo, sops/secrets wiring, hardware-configuration.nix.
+- Never turn off or delete an option listed under "Invariants" in GOALS.md below, ssh, or any service that holds state (databases, containers).
+- Prefer the smallest diff that removes the fault; do not refactor, reformat, or "improve" unrelated code.
+- Keep the user's intent as documented in GOALS.md below.
+
+## Context documents
+{_docs(cfg)}
+
+## Finish
+Print exactly one final line, and pick the honest one:
+{DONE_MARKER} FIXED <root cause, and what you changed>
+{DONE_MARKER} BLOCKED <root cause you found, and why you cannot fix it from these config trees>
+{DONE_MARKER} UNSOLVED <what you checked and ruled out>
+"""
+
+
 def run_agent(cfg: nix.Config, run: Run, prompt: str, order: list[str] | None = None) -> tuple[str | None, bool, str]:
     """Try agents in order. Returns (agent_name, completed_without_block, last_line)."""
     n = len(list(run.dir.glob("prompt-*.md"))) + 1
@@ -169,6 +213,12 @@ def run_agent(cfg: nix.Config, run: Run, prompt: str, order: list[str] | None = 
     agents = available(order, cfg)
     run.note("agent probe: " + ", ".join("%s=%s" % kv for kv in LAST_PROBE.items()))
     if not agents:
+        hit = {n: w for n, w in LAST_PROBE.items() if limited(w)}
+        if hit:
+            body = "; ".join("%s: %s" % kv for kv in hit.items())
+            run.note("agent usage limit hit, no pending raised (it heals itself): " + body)
+            notify("Agent usage limit hit", "Agent work postponed this run; nothing to do. " + body, "normal")
+            return None, False, "usage-limited: " + body
         body = "\n".join("- %s: %s — %s" % (n, LAST_PROBE.get(n, "?"), RELOGIN.get(n, "")) for n in (order or DEFAULT_ORDER))
         pending_add("auth", "No agent CLI is logged in; automatic fixes are paused",
                     body + "\n\nihc never uses API keys. Log in to at least one CLI with your subscription.", "Log in, then `ihc pending resolve <id>`; the next run retries.")
@@ -253,6 +303,13 @@ def revert(cfg: nix.Config, run: Run) -> None:
 
 def review_prompt(cfg: nix.Config, facts_summary: list[str], kind: str, evidence: str) -> str:
     roots = "\n".join("- %s" % r for r in cfg.config_repos)
+    aesthetics_note = ""
+    if kind == "hm":
+        from . import aesthetics, facts as facts_mod
+        found = aesthetics.present([f for r in cfg.config_repos for f in facts_mod._nix_files(r)])
+        aesthetics_note = ("\n## Aesthetics\nAesthetics: this configuration has a theming source of truth (%s). Verify that every "
+                           "surface's generated config in the new generation uses the palette and configured fonts (see the aesthetics "
+                           "section of the evidence); fix drift in the config trees, never by editing generated files.\n" % (", ".join(found) or "none detected"))
     return f"""You are ihc, an unattended maintenance agent. A {kind} activation just happened on this machine. Nobody will answer questions: investigate, verify, fix if needed, report.
 
 ## Your job
@@ -271,7 +328,7 @@ Nix flags for this tree: `{shlex.join(cfg.nix_args())}`.
 
 ## System summary (mined)
 {chr(10).join('- ' + l for l in facts_summary)}
-
+{aesthetics_note}
 ## Evidence
 {evidence[:90000]}
 

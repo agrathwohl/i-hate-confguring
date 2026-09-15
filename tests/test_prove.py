@@ -143,3 +143,18 @@ class GenericHealthTests(unittest.TestCase):
         self.assertEqual(mode, "boot")
         mode, _ = prove.decide_mode(None, Path("/"), {"restart": ["foo.service"]}, ["audio-daemon.service"], [r"display-manager"])
         self.assertEqual(mode, "switch")
+
+
+class DryRunParseTests(unittest.TestCase):
+    def test_lists_local_builds_by_log_prefix_name(self):
+        from ihc import prove
+        text = (
+            "these 2 derivations will be built:\n"
+            "  /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ollama-0.32.15.drv\n"
+            "  /nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-python3.13-requests-2.32.3.drv\n"
+            "these 3 paths will be fetched (12.00 MiB download, 40.00 MiB unpacked):\n"
+            "  /nix/store/cccccccccccccccccccccccccccccccc-glibc-2.40\n"
+        )
+        self.assertEqual(prove.parse_dry_run(text), ["ollama", "python3.13-requests"])
+        self.assertEqual(prove.drv_name("xdg-desktop-portal-hyprland-1.3.9"), "xdg-desktop-portal-hyprland")
+        self.assertEqual(prove.drv_name("source"), "source")

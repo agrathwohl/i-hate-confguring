@@ -58,6 +58,21 @@ TOOLS = [
         },
     },
     {
+        "name": "ask",
+        "description": "Diagnose and fix a user-described problem under the proof harness",
+        "inputSchema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]},
+    },
+    {
+        "name": "aesthetics",
+        "description": "Theming source of truth and per-surface colour drift",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "security",
+        "description": "Privilege, credential-exposure and known-vulnerable-package findings for this configuration",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "docs_check",
         "description": "Verify GOALS.md/MAINTENANCE.md citations",
         "inputSchema": {"type": "object", "properties": {}},
@@ -93,6 +108,12 @@ def _argv_for(name: str, args: dict) -> list[str]:
         if task:
             argv += ["--task", task]
         return argv
+    if name == "ask":
+        return ["ask", args["question"]]
+    if name == "aesthetics":
+        return ["aesthetics"]
+    if name == "security":
+        return ["security"]
     if name == "docs_check":
         return ["docs", "check"]
     raise ValueError("unknown tool: %s" % name)

@@ -225,3 +225,142 @@ class PruneOutlinksTests(unittest.TestCase):
                 have = sorted(p.name for p in runs.iterdir() if (p / "system").is_symlink())
                 self.assertEqual(have, ["2026-03-run", "2026-04-run"])
                 self.assertTrue(all((p / "report.md").exists() for p in runs.iterdir()))
+
+
+class LockMovesTests(unittest.TestCase):
+    def test_names_inputs_whose_rev_changed_since_head(self):
+        import json, os, subprocess, tempfile
+        from pathlib import Path
+        from ihc import run as run_mod
+        lock = lambda rev: json.dumps({"nodes": {
+            "root": {"inputs": {"nixpkgs": "nixpkgs_2", "same": "same"}},
+            "nixpkgs_2": {"locked": {"rev": rev}},
+            "same": {"locked": {"rev": "c" * 40}}}})
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            git = lambda *a: subprocess.run(["git", "-C", str(repo)] + list(a), check=True, capture_output=True, env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+            git("init", "-q")
+            (repo / "flake.lock").write_text(lock("a" * 40))
+            git("add", "-A")
+            git("commit", "-q", "-m", "base")
+            self.assertEqual(run_mod.lock_moves(repo), [])
+            (repo / "flake.lock").write_text(lock("b" * 40))
+            self.assertEqual(run_mod.lock_moves(repo), ["nixpkgs aaaaaaaa..bbbbbbbb"])
+
+
+class HeavyBumpTests(unittest.TestCase):
+    def test_step_streams_and_records_build_cost(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from ihc import store
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(store, "RUNS_DIR", Path(d) / "runs"), patch.object(store, "STATE_DIR", Path(d)), patch.object(store, "PENDING_DIR", Path(d) / "p"):
+                run = store.new_run("t")
+                st = run.step("build-hm", ["sh", "-c", "echo 'foo> start'; sleep 1.1; echo 'foo> done'; echo plain; echo err >&2"])
+                self.assertTrue(st.ok)
+                self.assertIn("plain", st.out)
+                self.assertIn("err", st.err)
+                self.assertGreaterEqual(store.ledger_read()["foo"]["seconds"], 1)
+                self.assertEqual(store.ledger_top(1)[0][0], "foo")
+                self.assertEqual(store.heavy_deferred("nixpkgs"), 0)
+                self.assertEqual(store.heavy_deferred("nixpkgs"), 0)
+                store.heavy_clear("nixpkgs")
+                self.assertEqual(store.heavy_deferred("nixpkgs"), 0)
+
+    def test_heavy_builds_uses_ledger_and_threshold(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from ihc import nix, prove, run as run_mod, store
+        with tempfile.TemporaryDirectory() as d:
+            cfg = nix.Config("nixos", Path(d), "h", "u", None, True, [], [], "h", "u", Path(d))
+            with patch.object(store, "STATE_DIR", Path(d)), patch.object(prove, "local_builds", lambda c, r, t: ["ollama", "tiny"]):
+                store.ledger_update({"ollama": 5000, "tiny": 3}, "r1")
+                self.assertEqual(run_mod.heavy_builds(cfg, None), [("ollama", 5000), ("tiny", 3)])
+                store.ledger_update({"ollama": 60}, "r2")
+                self.assertEqual(run_mod.heavy_builds(cfg, None), [])
+            (Path(d) / "MAINTENANCE.md").write_text("# M\n\n## Queue\n\n- [ ] (risk: low) existing\n\n## Other\n")
+            run_mod.queue_heavy_split(cfg, "nixpkgs", [("ollama", 5000)])
+            run_mod.queue_heavy_split(cfg, "nixpkgs", [("ollama", 5000)])
+            text = (Path(d) / "MAINTENANCE.md").read_text()
+            self.assertEqual(text.count("`ollama` rebuilds from source"), 1)
+            self.assertLess(text.index("`ollama` rebuilds"), text.index("existing"))
+
+
+class AskTests(unittest.TestCase):
+    def _go(self, last, changed, proof_ok=True, violations=None):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from ihc import agent, docs, nix, prove, run as run_mod, store
+        with tempfile.TemporaryDirectory() as d:
+            cfg = nix.Config("nixos", Path(d), "h", "u", None, True, [], [], "h", "u", Path(d))
+            with patch.object(store, "RUNS_DIR", Path(d) / "runs"), patch.object(store, "STATE_DIR", Path(d)), patch.object(store, "PENDING_DIR", Path(d) / "p"), \
+                 patch.object(run_mod.facts_mod, "summary_lines", lambda f: ["fact"]), \
+                 patch.object(agent, "run_agent", lambda c, r, p: ("claude", True, last)), \
+                 patch.object(agent, "changed_files", lambda c: ["a.nix"] if changed else []), \
+                 patch.object(agent, "diff_text", lambda c: "+ x"), \
+                 patch.object(agent, "revert", lambda c, r: None), \
+                 patch.object(agent, "policy_violations", lambda d2, inv: violations or []), \
+                 patch.object(docs, "invariant_options", lambda p2: []), \
+                 patch.object(prove, "check", lambda *a, **k: prove.Verdict(ok=proof_ok, failed_step=None if proof_ok else "build-hm")), \
+                 patch.object(run_mod, "fix_loop", lambda *a, **k: prove.Verdict(ok=proof_ok, failed_step="build-hm")), \
+                 patch.object(run_mod, "commit_drift", lambda *a, **k: []):
+                run = store.new_run("ask")
+                return run_mod.ask(cfg, run, {"runtime": {}}, "why is it broken")
+
+    def test_fixed_when_changed_and_proof_passes(self):
+        res = self._go("FIXED the clock module cached the date", True)
+        self.assertEqual(res["verdict"], "FIXED")
+        self.assertIn("next activation", res["detail"])
+
+    def test_honest_unsolved_when_agent_claims_fix_but_changed_nothing(self):
+        res = self._go("FIXED it", False)
+        self.assertEqual(res["verdict"], "UNSOLVED")
+
+    def test_blocked_when_proof_fails_and_reverted(self):
+        res = self._go("FIXED it", True, proof_ok=False)
+        self.assertEqual(res["verdict"], "BLOCKED")
+        self.assertIn("reverted", res["detail"])
+
+    def test_blocked_verdict_passes_through_without_changes(self):
+        res = self._go("BLOCKED upstream widget bug", False)
+        self.assertEqual(res["verdict"], "BLOCKED")
+        self.assertEqual(res["detail"], "upstream widget bug")
+
+
+class StepSurvivesLaunchFailureTests(unittest.TestCase):
+    def test_unlaunchable_binary_becomes_exit_127_not_an_exception(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from ihc import store
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / "notexec"
+            bad.write_text("#!/bin/sh\n")
+            bad.chmod(0o644)  # present but not executable -> PermissionError, not FileNotFoundError
+            with patch.object(store, "RUNS_DIR", Path(d) / "runs"), patch.object(store, "STATE_DIR", Path(d)), \
+                 patch.object(store, "PENDING_DIR", Path(d) / "p"):
+                run = store.new_run("t")
+                st = run.step("launch", [str(bad)])
+                self.assertEqual(st.exit, 127)
+                self.assertIn("Permission denied", st.err)
+                st2 = run.step("missing", [str(Path(d) / "nope")])
+                self.assertEqual(st2.exit, 127)
+
+
+class UnitCannotKillItsOwnActivationTests(unittest.TestCase):
+    """ihc runs the activation from inside its own unit, so the activation must not stop it.
+
+    Without these directives sd-switch (home-manager) and switch-to-configuration (NixOS) stop
+    the running unit mid-activation: units stay stopped, and the gcroot that records the current
+    generation is never updated, so every later activation diffs against a frozen unit set.
+    """
+
+    def test_both_modules_declare_the_guard(self):
+        from pathlib import Path
+        flake = Path(__file__).resolve().parent.parent / "flake.nix"
+        text = flake.read_text()
+        self.assertIn('Unit.X-SwitchMethod = "keep-old";', text)       # home-manager / sd-switch
+        self.assertIn("unitConfig.X-RestartIfChanged = false;", text)  # NixOS

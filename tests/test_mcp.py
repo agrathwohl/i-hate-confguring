@@ -35,7 +35,7 @@ class HandleTests(unittest.TestCase):
     def test_tools_list(self):
         resp = mcp.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
         names = {t["name"] for t in resp["result"]["tools"]}
-        self.assertEqual(names, {"status", "facts", "check", "bump", "fix", "docs_check"})
+        self.assertEqual(names, {"status", "facts", "check", "bump", "fix", "ask", "aesthetics", "security", "docs_check"})
         for tool in resp["result"]["tools"]:
             self.assertIn("description", tool)
             self.assertIn("inputSchema", tool)
@@ -125,3 +125,13 @@ class FixWithoutTargetTests(unittest.TestCase):
             mcp.DISPATCH = None
         self.assertEqual(seen["argv"][:3], ["fix", "--target", "all"])
         self.assertFalse(res["result"]["isError"])
+
+
+class AskArgvTests(unittest.TestCase):
+    def test_ask_maps_to_cli_argv(self):
+        from ihc import mcp
+        self.assertEqual(mcp._argv_for("ask", {"question": "the bar clock is stale"}), ["ask", "the bar clock is stale"])
+
+    def test_security_maps_to_cli_argv(self):
+        from ihc import mcp
+        self.assertEqual(mcp._argv_for("security", {}), ["security"])

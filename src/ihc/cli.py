@@ -9,7 +9,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import __version__
+from . import __version__, store
 
 
 def _cfg(args):
@@ -81,7 +81,7 @@ def cmd_bump(args) -> int:
         run = new_run("bump")
         fx = facts.mine(cfg)
         commit_drift(cfg, run, "chore(ihc): commit live drift before bump")
-        res = bump(cfg, run, fx, args.inputs or None, args.max_attempts)
+        res = bump(cfg, run, fx, args.inputs or None, args.max_attempts, allow_heavy=args.allow_heavy)
         run.verdict = {"ok": not res["blocked"], "summary": "bumped %d, blocked %d" % (len(res["bumped"]), len(res["blocked"])), **{k: v for k, v in res.items() if k != "last_verdict"}}
         run.write_report()
     print(json.dumps({k: v for k, v in res.items() if k != "last_verdict"}, indent=2))
@@ -115,6 +115,25 @@ def cmd_fix(args) -> int:
     print(v.summary())
     print("evidence: %s" % run.dir)
     return 0 if v.ok else 1
+
+
+def cmd_ask(args) -> int:
+    from . import facts
+    from .notify import notify
+    from .run import ask, commit_drift
+    from .store import lock, new_run
+    cfg = _cfg(args)
+    with lock():
+        run = new_run("ask")
+        fx = facts.mine(cfg)
+        commit_drift(cfg, run, "chore(ihc): commit live drift before ask")
+        res = ask(cfg, run, fx, args.question)
+        run.verdict = res
+        run.write_report()
+    print("%s: %s" % (res["verdict"], res.get("detail", "")))
+    print("evidence: %s" % run.dir)
+    notify("ihc ask: " + res["verdict"], (args.question[:100] + " — " + res.get("detail", ""))[:300], "normal")
+    return 0 if res["verdict"] == "FIXED" else 1
 
 
 def cmd_switch(args) -> int:
@@ -173,7 +192,7 @@ def cmd_run(args) -> int:
     with lock():
         run = new_run("run")
         code = pipeline(cfg, run, switch_policy=args.switch, do_bump=not args.no_bump, only=args.inputs or None,
-                        max_attempts=args.max_attempts, do_improve=args.improve, improve_risk=args.improve_risk)
+                        max_attempts=args.max_attempts, do_improve=args.improve, improve_risk=args.improve_risk, allow_heavy=args.allow_heavy)
     print(json.dumps(run.verdict, indent=2, default=str))
     print("evidence: %s" % run.dir)
     return code
@@ -209,6 +228,78 @@ def cmd_docs(args) -> int:
     return 0
 
 
+def cmd_aesthetics(args) -> int:
+    """Does the configured look derive from one source of truth on every surface?"""
+    from . import aesthetics, facts
+    cfg = _cfg(args)
+    fx = facts.mine(cfg, runtime=False)
+    gen = args.generation or (cfg.hm_profile.resolve() if cfg.hm_profile.exists() else None)
+    rep = aesthetics.report(cfg, fx, generation=gen)
+    if args.json:
+        print(json.dumps(rep, indent=2, default=str))
+    else:
+        print("\n".join(rep["summary"]))
+    if not args.fix:
+        return 0
+    task = aesthetics.fix_task(rep)
+    if not task:
+        print("nothing to fix")
+        return 0
+    from . import prove
+    from .run import commit_drift, fix_loop
+    from .store import lock, new_run
+    with lock():
+        run = new_run("aesthetics")
+        commit_drift(cfg, run, "chore(ihc): commit live drift before aesthetics fix")
+        v = fix_loop(cfg, run, fx, prove.Verdict(ok=False, failed_step="aesthetics", failed_target="hm"),
+                     args.max_attempts, task, "hm", False)
+        if v.ok:
+            commit_drift(cfg, run, "fix(aesthetics): derive every surface from the palette (agent)")
+        run.verdict = v.as_dict()
+        run.write_report()
+    print(v.summary())
+    print("evidence: %s" % run.dir)
+    return 0 if v.ok else 1
+
+
+def cmd_security(args) -> int:
+    """What in this configuration grants privilege, exposes a credential, or is known-vulnerable?"""
+    from . import facts, security
+    cfg = _cfg(args)
+    fx = facts.mine(cfg)
+    rep = security.report(cfg, fx)
+    if args.cve:
+        from .store import lock, new_run
+        with lock():
+            run = new_run("security")
+            rep["cve"] = security.cve_scan(cfg, run, security.scan_targets(cfg))
+            run.verdict = {"ok": True, "summary": "security scan"}
+            run.write_report()
+        rep["summary"] = security.summary_lines(rep)
+    print(json.dumps(rep, indent=2, default=str) if args.json else "\n".join(rep["summary"]))
+    if not args.fix:
+        return 0
+    task = security.fix_task(rep)
+    if not task:
+        print("nothing here is safe to fix automatically; the rest are decisions (`ihc pending list`)")
+        return 0
+    from . import prove
+    from .run import commit_drift, fix_loop
+    from .store import lock, new_run
+    with lock():
+        run = new_run("security")
+        commit_drift(cfg, run, "chore(ihc): commit live drift before security fix")
+        v = fix_loop(cfg, run, fx, prove.Verdict(ok=False, failed_step="security", failed_target="all"),
+                     args.max_attempts, task, "all", False)
+        if v.ok:
+            commit_drift(cfg, run, "fix(security): pin unhashed remote fetches (agent)")
+        run.verdict = v.as_dict()
+        run.write_report()
+    print(v.summary())
+    print("evidence: %s" % run.dir)
+    return 0 if v.ok else 1
+
+
 def cmd_notify(args) -> int:
     from .notify import notify
     return 0 if notify(args.title, args.body, args.urgency) or args.quiet else 1
@@ -233,6 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ihc", description="proof-first Nix maintenance loop driven by your already-logged-in agent CLIs")
     p.add_argument("--version", action="version", version="ihc " + __version__)
     p.add_argument("--flake", help="flake directory (default: discovered, or $IHC_FLAKE)")
+    p.add_argument("-v", "--verbose", action="store_true", help="stream every command's output to stderr (also $IHC_VERBOSE=1)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("facts", help="mine the system; print a summary or --json")
@@ -258,6 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("bump", help="update inputs one at a time; fix breakage with an agent; revert what cannot be fixed")
     s.add_argument("inputs", nargs="*", help="input names (default: all non-local, non-pinned; nixpkgs first)")
     s.add_argument("--max-attempts", type=int, default=3)
+    s.add_argument("--allow-heavy", action="store_true", help="bump even when it rebuilds heavy packages from source (see README, Heavy builds)")
     s.set_defaults(fn=cmd_bump)
 
     s = sub.add_parser("fix", help="let an agent repair the failing build (or do --task), then prove it")
@@ -266,6 +359,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-attempts", type=int, default=3)
     s.add_argument("--eval-only", action="store_true", help="prove by evaluation only (no builds)")
     s.set_defaults(fn=cmd_fix)
+
+    s = sub.add_parser("ask", help="describe a problem in your own words; the agent diagnoses and fixes it under the proof harness")
+    s.add_argument("question")
+    s.set_defaults(fn=cmd_ask)
 
     s = sub.add_parser("switch", help="prove, then activate with the safety policy (rollback on health regression)")
     target(s)
@@ -285,6 +382,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-bump", action="store_true")
     s.add_argument("--inputs", nargs="*")
     s.add_argument("--max-attempts", type=int, default=3)
+    s.add_argument("--allow-heavy", action="store_true", help="bump even when it rebuilds heavy packages from source (see README, Heavy builds)")
     s.add_argument("--improve", action="store_true", help="also do one MAINTENANCE.md queue item")
     s.add_argument("--improve-risk", choices=["low", "medium", "high"], default="low")
     s.set_defaults(fn=cmd_run)
@@ -293,6 +391,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("action", choices=["check", "regen"])
     s.add_argument("--dir", type=lambda v: Path(v).expanduser(), help="docs directory (default: $IHC_DOCS_DIR or the flake dir)")
     s.set_defaults(fn=cmd_docs)
+
+    s = sub.add_parser("aesthetics", help="is the configured look derived from one source of truth on every surface?")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--fix", action="store_true", help="let the agent make the drifting surfaces derive from the palette")
+    s.add_argument("--generation", type=lambda v: Path(v).expanduser(), help="scan a built generation instead of the active one")
+    s.add_argument("--max-attempts", type=int, default=3)
+    s.set_defaults(fn=cmd_aesthetics)
+
+    s = sub.add_parser("security", help="what grants privilege, exposes a credential, or is known-vulnerable?")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--fix", action="store_true", help="let the agent pin unhashed remote fetches — the only class ihc will hand to an agent, and never from the nightly run")
+    s.add_argument("--cve", action="store_true", help="also scan the live closure with vulnix (needs network; minutes on a cold cache)")
+    s.add_argument("--max-attempts", type=int, default=3)
+    s.set_defaults(fn=cmd_security)
 
     s = sub.add_parser("notify", help="send a desktop notification (and log it)")
     s.add_argument("title")
@@ -326,6 +438,8 @@ def dispatch(argv: list[str]) -> tuple[int, str]:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.verbose:
+        store.VERBOSE = True
     return args.fn(args)
 
 

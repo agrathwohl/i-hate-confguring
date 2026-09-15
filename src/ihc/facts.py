@@ -11,7 +11,8 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import docs, nix
+from . import aesthetics, docs, nix, security
+from .store import ledger_top
 
 SECRET_PATTERNS = [
     ("assignment", re.compile(r'(api[_-]?key|apikey|password|passwd|token|secret|client_secret)\s*=\s*"([^"]{6,})"', re.I)),
@@ -389,6 +390,12 @@ def fingerprint(facts: dict) -> str:
         "theming": [(h["file"], h["line"]) for h in facts.get("theming", [])][:50],
         "secrets": [(s["file"], s["line"]) for s in facts.get("secrets", [])],
         "deprecated": [(d["option"], d["file"], d["line"]) for d in facts.get("deprecated_options", [])],
+        "aesthetics": {
+            "frameworks": sorted(k for k, v in facts.get("aesthetics", {}).get("frameworks", {}).items() if v),
+            "profiles": [p["name"] for p in facts.get("aesthetics", {}).get("profiles", [])],
+            "surfaces": {s["label"]: s["verdict"] for s in facts.get("aesthetics", {}).get("surfaces", [])},
+        },
+        "security": sorted((f["id"], f["file"], f["line"]) for f in facts.get("security", {}).get("findings", []) if f.get("source") != "eval"),
     }
     return hashlib.sha256(json.dumps(keys, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
@@ -518,6 +525,7 @@ def mine(cfg: nix.Config, runtime: bool = True) -> dict:
             "last_system_switch": datetime.fromtimestamp(cfg.system_profile.lstat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if cfg.system_profile.exists() else None,
             "last_hm_switch": datetime.fromtimestamp(cfg.hm_profile.lstat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if cfg.hm_profile.exists() else None,
             "boot_entries": boot_entries(),
+            "build_ledger": ledger_top(5),
             "disk": disk(),
             "hardware": hardware(),
             "failed_units": failed_units(),
@@ -527,6 +535,10 @@ def mine(cfg: nix.Config, runtime: bool = True) -> dict:
             "local_inputs": {i["name"]: git_state(Path(i["ref"].replace("file://", ""))) for i in facts["inputs"] if i["local"]},
             "drift": drift(cfg),
         }
+    gen = cfg.hm_profile.resolve() if runtime and cfg.hm_profile.exists() else None
+    facts["aesthetics"] = aesthetics.report(cfg, facts, generation=gen)
+    facts["security"] = security.report(cfg, facts, do_probe=False)
+    if runtime:
         facts["fingerprint"] = fingerprint(facts)
     return facts
 
@@ -545,6 +557,8 @@ def summary_lines(facts: dict) -> list[str]:
             "disk free: / %s GiB, /boot %s GiB (need ~%s MiB per generation), failed units: %s" % (d.get("root", {}).get("free_gib"), d.get("boot", {}).get("free_gib"), d.get("boot_need_mib"), rt.get("failed_units")),
             "agents: " + ", ".join("%s(%s%s)" % (a["name"], "authed" if a["authed"] else "no-auth", "" if a["path"] else ",missing") for a in rt.get("agents", [])),
         ]
+    if rt.get("build_ledger"):
+        lines.append("built from source lately (no configured binary cache had them): " + ", ".join("%s %d min" % (n, secs // 60) for n, secs in rt["build_ledger"]))
     if facts.get("secrets"):
         lines.append("secrets in config: %d finding(s), e.g. %s:%s" % (len(facts["secrets"]), facts["secrets"][0]["file"], facts["secrets"][0]["line"]))
     if facts.get("deprecated_options"):
@@ -557,6 +571,8 @@ def summary_lines(facts: dict) -> list[str]:
     assets = facts.get("config_assets", [])
     if assets:
         lines.append("config assets: %d files, %.0f MB, %d not tracked by git" % (len(assets), sum(a["mb"] for a in assets), sum(1 for a in assets if not a["tracked"])))
+    lines += (facts.get("aesthetics", {}).get("summary", []) or [])[:2]
+    lines += (facts.get("security", {}).get("summary", []) or [])[:2]
     hr = facts.get("host_rules", {})
     lines.append("host rules from MAINTENANCE.md: %d guarded units, %d health probes, %d busy checks" % (len(facts.get("guarded_units", [])), len(hr.get("health_probes", {})), len(hr.get("busy_checks", {}))))
     return lines

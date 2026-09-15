@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from . import nix
+from . import aesthetics, nix
 from .store import Run, Step
 
 MIN_STORE_FREE_GIB = float(os.environ.get("IHC_MIN_STORE_FREE_GIB", "10"))
@@ -158,6 +158,30 @@ def health_regressions(before: dict, after: dict) -> list[str]:
         if isinstance(v, bool) and v and after.get(k) is False:
             regs.append("%s went down" % k)
     return regs
+
+
+DRV_RE = re.compile(r"/nix/store/[a-z0-9]{32}-(.+)\.drv\b")
+
+
+def drv_name(name: str) -> str:
+    """`ollama-0.32.15` -> `ollama`: the name Nix prints as the `-L` log prefix (up to the first `-<digit>`)."""
+    return re.sub(r"-[0-9].*$", "", name)
+
+
+def parse_dry_run(text: str) -> list[str]:
+    """Derivations `nix build --dry-run` says it will build locally (no configured substituter has them)."""
+    seen: list[str] = []
+    for m in DRV_RE.finditer(text):
+        n = drv_name(m.group(1))
+        if n not in seen:
+            seen.append(n)
+    return seen
+
+
+def local_builds(cfg: nix.Config, run: Run, target: str) -> list[str]:
+    attr = cfg.system_attr if target == "system" else cfg.hm_attr_path
+    step = run.step("dry-run-" + target, ["nix", "build", "--dry-run"] + cfg.nix_args() + [attr], cwd=cfg.flake_dir, env=cfg.env())
+    return parse_dry_run(step.out + "\n" + step.err) if step.ok else []
 
 
 def busy(facts: dict) -> list[str]:
@@ -414,6 +438,9 @@ def switch_evidence(cfg: nix.Config, run: Run, fx: dict, kind: str, since: str, 
     lines += ["## systemd unit transitions since activation (%s)" % ("user" if user else "system"), "", "```", ("\n".join(trans[-200:]) or "(none)"), "```", ""]
     jr = run.step("post-journal", ["journalctl"] + scope + ["--since", since, "-p", "warning", "--no-pager", "-o", "short-iso"])
     lines += ["## journal since activation, priority warning and above (%s)" % ("user" if user else "system"), "", "```", (jr.out.strip() or "(nothing)")[-12000:], "```", ""]
+    if kind.startswith("hm"):
+        gen = cfg.hm_profile.resolve() if cfg.hm_profile.exists() else None
+        lines += ["## aesthetics", "", "```json", json.dumps(aesthetics.report(cfg, fx, generation=gen), default=str), "```", ""]
     diff = run.dir / ("%s-diff.txt" % ("hm" if user else "system"))
     if diff.exists():
         lines += ["## closure diff (old -> new)", "", "```", diff.read_text()[-12000:], "```", ""]

@@ -19,7 +19,6 @@
         pkgs.findutils
         pkgs.util-linux
         pkgs.libnotify
-        pkgs.sudo
       ];
 
       execStart = cfg:
@@ -103,6 +102,11 @@
           config = lib.mkIf cfg.enable {
             systemd.user.services.ihc = {
               Unit.Description = "ihc maintenance run";
+              # ihc performs the home-manager activation from inside this unit. Without this,
+              # sd-switch stops it mid-activation: units end up stopped and never started, and
+              # the current-home gcroot is never updated, so every later activation diffs
+              # against a frozen unit set and stops even more.
+              Unit.X-SwitchMethod = "keep-old";
 
               Service = {
                 Type = "oneshot";
@@ -113,8 +117,7 @@
                 Environment =
                   lib.mapAttrsToList (n: v: "${n}=${v}") cfg.environment
                   ++ [
-                    ("PATH=" + lib.makeBinPath (runtimeTools pkgs ++ cfg.extraPath)
-                      + ":/run/wrappers/bin"
+                    ("PATH=/run/wrappers/bin:" + lib.makeBinPath (runtimeTools pkgs ++ cfg.extraPath)
                       + ":/run/current-system/sw/bin"
                       + ":/etc/profiles/per-user/${config.home.username}/bin"
                       + ":${config.home.homeDirectory}/.nix-profile/bin"
@@ -195,6 +198,9 @@
           config = lib.mkIf cfg.enable {
             systemd.services.ihc = {
               description = "ihc maintenance run";
+              # Same reason as the home-manager unit: switch-to-configuration must not restart
+              # the unit that is running the system activation.
+              unitConfig.X-RestartIfChanged = false;
 
               serviceConfig = {
                 Type = "oneshot";
@@ -209,8 +215,7 @@
                     # %U expands to the numeric UID of the unit's User.
                     "XDG_RUNTIME_DIR=/run/user/%U"
                     "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus"
-                    ("PATH=" + lib.makeBinPath (runtimeTools pkgs ++ cfg.extraPath)
-                      + ":/run/wrappers/bin"
+                    ("PATH=/run/wrappers/bin:" + lib.makeBinPath (runtimeTools pkgs ++ cfg.extraPath)
                       + ":/run/current-system/sw/bin"
                       + ":/etc/profiles/per-user/${cfg.user}/bin"
                       + ":/home/${cfg.user}/.nix-profile/bin"

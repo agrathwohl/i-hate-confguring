@@ -68,6 +68,8 @@ MAINTENANCE.md: keep the methodology sections intact; refresh the "Findings" and
 ## Guarded units      one bullet per unit whose restart must not interrupt the running session (audio servers, display manager, container runtimes, databases, VM managers...): `- jack.service`
 ## Health probes      `- name: shell command` that must exit 0 after an activation (e.g. a sound card present in /proc/asound/cards, a GPU tool answering, a daemon listening) — one per priority in GOALS.md
 ## Busy checks        `- name: shell command` whose exit 0 means the user is in the middle of something (a DAW running, a recording, a render) so activation must wait for the next boot
+## Aesthetic surfaces  `- <label>: <path relative to $HOME>` — one bullet per surface whose *generated* config the harness should scan for colours that do not come from the theming source of truth (add the ones the built-in table misses). When the facts show theming frameworks, describe that system in GOALS.md: which source of truth the colours, fonts and wallpaper come from, and that every surface must derive from it.
+## Security exceptions  `- <check id>: <why this is accepted on this host>` — one bullet per `ihc security` finding the user has decided to live with (ids come from `ihc security --json`); never invent ids, only record decisions the user has already made.
 Drift facts (`runtime.drift`): files under /etc that are regular files where the system expects store symlinks, home-manager backup collisions, packages installed imperatively into the user profile — list them in Findings and add queue items to adopt them into the configuration or remove them.
 
 Facts:
@@ -101,6 +103,44 @@ def host_rules(docs_dir: Path) -> dict:
                 out["guarded_units"].append(key)
             elif val:
                 out["health_probes" if title == "Health probes" else "busy_checks"][key] = val
+    return out
+
+
+AESTHETIC_SECTION_RE = re.compile(r"^## Aesthetic surfaces\s*$", re.M)
+
+
+def aesthetic_surfaces(docs_dir: Path) -> dict:
+    """`## Aesthetic surfaces` in MAINTENANCE.md: `- <label>: <path relative to $HOME>`.
+    Extends the built-in surface table with whatever this host also themes."""
+    out: dict = {}
+    p = docs_dir / "MAINTENANCE.md" if docs_dir else None
+    if not p or not p.exists():
+        return out
+    parts = AESTHETIC_SECTION_RE.split(p.read_text(errors="replace"))
+    for body in parts[1:]:
+        for m in BULLET_RE.finditer(body.split("\n## ", 1)[0]):
+            label, path = m.group(1).strip(), (m.group(2) or "").strip()
+            if path:
+                out[label] = path.lstrip("~/")
+    return out
+
+
+SECURITY_SECTION_RE = re.compile(r"^## Security exceptions\s*$", re.M)
+
+
+def security_exceptions(docs_dir: Path) -> dict:
+    """`## Security exceptions` in MAINTENANCE.md: `- <check id>: <why it is fine on this host>`.
+    A listed `ihc security` finding stops counting and stops escalating, with the reason attached."""
+    out: dict = {}
+    p = docs_dir / "MAINTENANCE.md" if docs_dir else None
+    if not p or not p.exists():
+        return out
+    parts = SECURITY_SECTION_RE.split(p.read_text(errors="replace"))
+    for body in parts[1:]:
+        for m in BULLET_RE.finditer(body.split("\n## ", 1)[0]):
+            check_id, reason = m.group(1).strip(), (m.group(2) or "").strip()
+            if reason:
+                out[check_id] = reason
     return out
 
 
