@@ -168,6 +168,21 @@ def _version(cmd: str) -> str | None:
     return out[0][:60] if out else None
 
 
+CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def _claude_keychain() -> bool:
+    """On macOS Claude Code keeps its login in the Keychain, not in ~/.claude/.credentials.json.
+    Attributes only (no -w): the secret is never read, so no access prompt."""
+    if not shutil.which("security"):
+        return False
+    try:
+        return subprocess.run(["security", "find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE],
+                              capture_output=True, timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def agents_available() -> list[dict]:
     home = Path.home()
     table = [
@@ -178,12 +193,15 @@ def agents_available() -> list[dict]:
     out = []
     for name, auth in table:
         path = shutil.which(name)
+        authed, auth_file = auth.exists(), str(auth)
+        if name == "claude" and not authed and _claude_keychain():
+            authed, auth_file = True, "keychain:" + CLAUDE_KEYCHAIN_SERVICE
         out.append({
             "name": name,
             "path": path,
             "version": _version(name) if path else None,
-            "authed": auth.exists(),
-            "auth_file": str(auth),
+            "authed": authed,
+            "auth_file": auth_file,
         })
     return out
 
