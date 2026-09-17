@@ -188,6 +188,7 @@ def discover(flake_dir: Path | None = None) -> Config:
     fd = Path(flake_dir).expanduser() if flake_dir else default_flake_dir(platform)
     if fd is None:
         raise SystemExit("ihc: no flake.nix found; set IHC_FLAKE=/path/to/flake")
+    fd = fd.resolve()  # reachable() resolves paths; on macOS /etc is a symlink to /private/etc
     text = (fd / "flake.nix").read_text(errors="replace") if (fd / "flake.nix").exists() else ""
     container = "darwinConfigurations" if platform == "darwin" else "nixosConfigurations"
     host_attr = pick_host(_attr_names(text, container), hostname) if platform != "hm-only" else None

@@ -324,7 +324,7 @@ def hardware() -> dict:
         hw["rtprio_limit"] = resource.getrlimit(resource.RLIMIT_RTPRIO)[1]
         ml = resource.getrlimit(resource.RLIMIT_MEMLOCK)[1]
         hw["memlock_limit"] = "unlimited" if ml == resource.RLIM_INFINITY else ml
-    except (ValueError, OSError):
+    except (ValueError, OSError, AttributeError):  # RLIMIT_RTPRIO is Linux-only
         pass
     return hw
 
