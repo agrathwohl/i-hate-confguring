@@ -364,3 +364,74 @@ class UnitCannotKillItsOwnActivationTests(unittest.TestCase):
         text = flake.read_text()
         self.assertIn('Unit.X-SwitchMethod = "keep-old";', text)       # home-manager / sd-switch
         self.assertIn("unitConfig.X-RestartIfChanged = false;", text)  # NixOS
+
+
+class CollectGarbageTests(unittest.TestCase):
+    """ihc frees store space itself. It must never use -d: old generations are the rollback targets."""
+
+    def _go(self, free_before, free_after, stale=(), pendings=()):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from ihc import facts as facts_mod, nix, prove, run as run_mod, store
+        seen = {"argv": [], "pending": []}
+        with tempfile.TemporaryDirectory() as d:
+            cfg = nix.Config("nixos", Path(d), "h", "u", None, True, [], [], "h", "u", Path(d))
+            fx = {"runtime": {"disk": {"nix_store": {"free_gib": free_before}}}}
+            with patch.object(store, "RUNS_DIR", Path(d) / "runs"), patch.object(store, "STATE_DIR", Path(d)), \
+                 patch.object(store, "PENDING_DIR", Path(d) / "p"), \
+                 patch.object(facts_mod, "disk", lambda: {"nix_store": {"free_gib": free_after}}), \
+                 patch.object(prove, "sudo_ok", lambda c: True), \
+                 patch.object(run_mod, "stale_profile_links", lambda limit=12: list(stale)), \
+                 patch.object(run_mod, "closure_sizes", lambda r, t: {x: 20 * 2**30 for x in t}), \
+                 patch.object(run_mod, "pending_list", lambda: list(pendings)), \
+                 patch.object(run_mod, "pending_add", lambda *a: seen["pending"].append(a)):
+                run = store.new_run("t")
+                with patch.object(run, "step", lambda name, argv, **kw: seen["argv"].append(argv) or store.Step(name, argv, 0, "", "", 0.0, None)):
+                    return run_mod.collect_garbage(cfg, run, fx), seen
+
+    def test_a_store_with_room_is_left_alone(self):
+        out, seen = self._go(500.0, 500.0)
+        self.assertFalse(out["ran"])
+        self.assertEqual(seen["argv"], [])
+
+    def test_a_short_store_is_collected_and_never_with_dash_d(self):
+        out, seen = self._go(2.0, 40.0)
+        self.assertTrue(out["ran"])
+        flat = [a for argv in seen["argv"] for a in argv]
+        self.assertIn("nix-collect-garbage", flat)
+        self.assertIn("--delete-older-than", flat)
+        self.assertNotIn("-d", flat)
+        self.assertNotIn("--delete-old", flat)
+
+    def test_it_reports_what_it_freed(self):
+        out, _ = self._go(2.0, 40.5)
+        self.assertEqual(out["freed_gib"], 38.5)
+        self.assertFalse(out["still_short"])
+
+    def test_a_store_still_short_escalates_the_profiles_that_pin_it(self):
+        stale = [{"link": "/nix/var/nix/profiles/system-profiles/old-1-link", "target": "/nix/store/x", "days": 900}]
+        out, seen = self._go(2.0, 3.0, stale=stale)
+        self.assertTrue(out["still_short"])
+        self.assertEqual(out["pinned"][0]["gib"], 20.0)
+        self.assertEqual(len(seen["pending"]), 1)
+        kind, title, body, resolve = seen["pending"][0]
+        self.assertEqual(kind, "disk")
+        self.assertIn("old-1-link", body)
+        self.assertIn("900 days", body)
+        self.assertNotIn("rm -rf", resolve)
+
+    def test_it_raises_only_one_disk_pending(self):
+        stale = [{"link": "/l", "target": "/nix/store/x", "days": 900}]
+        out, seen = self._go(2.0, 3.0, stale=stale, pendings=[{"kind": "disk"}])
+        self.assertTrue(out["still_short"])
+        self.assertEqual(seen["pending"], [])
+
+    def test_stale_profile_links_skips_the_current_generation(self):
+        import os
+        from ihc import run as run_mod
+        rows = run_mod.stale_profile_links()
+        live = os.path.realpath("/nix/var/nix/profiles/system")
+        self.assertNotIn(live, [r["target"] for r in rows])
+        for r in rows:
+            self.assertGreaterEqual(r["days"], 0)

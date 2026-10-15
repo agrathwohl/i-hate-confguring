@@ -485,6 +485,105 @@ def security_fix(cfg: nix.Config, run: Run, fx: dict, max_attempts: int) -> dict
     return out
 
 
+# ---- garbage collection --------------------------------------------------------
+
+GC_KEEP_DAYS = int(os.environ.get("IHC_GC_KEEP_DAYS", "14"))
+
+
+def stale_profile_links(limit: int = 12) -> list[dict]:
+    """Profile generation links that are not current, oldest first.
+
+    `nixos-rebuild --profile-name X` and old per-user profiles each pin a whole closure, so a
+    bounded collection cannot touch them however old they are. They are the usual reason a store
+    stays full after a garbage collection, and deleting one destroys a rollback target the user
+    made on purpose -- so ihc reports them and never removes them itself.
+    """
+    live = set()
+    for cur in [Path("/nix/var/nix/profiles/system"), Path("/nix/var/nix/profiles/default")] + \
+               list((Path.home() / ".local/state/nix/profiles").glob("*")) + \
+               list((Path.home() / ".nix-profile").parent.glob(".nix-profile")):
+        try:
+            live.add(os.path.realpath(cur))
+        except OSError:
+            pass
+    out = []
+    for d in (Path("/nix/var/nix/profiles"), Path("/nix/var/nix/profiles/system-profiles")):
+        if not d.is_dir():
+            continue
+        try:
+            links = sorted(d.glob("*-link"))
+        except OSError:
+            continue
+        for link in links:
+            try:
+                target = os.path.realpath(link)
+                days = int((time.time() - link.lstat().st_mtime) / 86400)
+            except OSError:
+                continue
+            if target in live:
+                continue
+            out.append({"link": str(link), "target": target, "days": days})
+    out.sort(key=lambda r: -r["days"])
+    return out[:limit]
+
+
+def closure_sizes(run: Run, targets: list[str]) -> dict[str, int]:
+    """One `nix path-info -S` for every target: 30 separate calls take minutes."""
+    if not targets:
+        return {}
+    st = run.step("profile-sizes", ["nix", "path-info", "-S"] + targets)
+    sizes = {}
+    for line in (st.out or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            sizes[parts[0]] = int(parts[1])
+    return sizes
+
+
+def collect_garbage(cfg: nix.Config, run: Run, fx: dict) -> dict:
+    """Free store space when the store is short, then report what it could not reclaim.
+
+    Bounded on purpose. `nix-collect-garbage -d` deletes every old generation, and those
+    generations are exactly the rollback targets the proof pipeline depends on. This deletes only
+    generations older than IHC_GC_KEEP_DAYS and the dead paths that fall out of that.
+    """
+    out: dict = {"ran": False, "freed_gib": 0.0, "still_short": False, "pinned": []}
+    before = prove.store_short(fx)
+    if before is None:
+        return out
+    out["ran"] = True
+    argv = ["nix-collect-garbage", "--delete-older-than", "%dd" % GC_KEEP_DAYS]
+    run.step("gc-user", argv)
+    if cfg.platform != "hm-only" and prove.sudo_ok(cfg):
+        run.step("gc-system", argv, sudo=True)
+    d = facts_mod.disk()
+    after = d.get("nix_store", {}).get("free_gib")
+    if after is not None:
+        out["freed_gib"] = round(after - before, 2)
+    run.note("garbage collection: freed %.1f GiB (kept generations newer than %d days)" % (out["freed_gib"], GC_KEEP_DAYS))
+    if prove.store_short({"runtime": {"disk": d}}) is None:
+        return out
+    out["still_short"] = True
+    stale = stale_profile_links()
+    sizes = closure_sizes(run, [r["target"] for r in stale])
+    for r in stale:
+        r["gib"] = round(sizes.get(r["target"], 0) / 2**30, 1)
+    out["pinned"] = stale
+    if not stale or any(p["kind"] == "disk" for p in pending_list()):
+        return out
+    body = ["The store is still short after collecting garbage. These profile links are not the",
+            "current generation, and each one pins a whole closure, so no collection can free them:",
+            ""]
+    body += ["  %5.1f GiB  %4d days old  %s" % (r["gib"], r["days"], r["link"]) for r in stale]
+    body += ["", "Each is a rollback target somebody created on purpose, so ihc will not delete one."]
+    pending_add("disk", "The Nix store is full and old profiles are pinning it",
+                "\n".join(body),
+                "Delete the ones you no longer want, then collect again:\n"
+                "  sudo rm <link>\n  sudo nix-collect-garbage --delete-older-than %dd\n"
+                "Then `ihc pending resolve <id>`." % GC_KEEP_DAYS)
+    return out
+
+
 # ---- ask: one-shot user-reported problem ---------------------------------------
 
 def ask(cfg: nix.Config, run: Run, fx: dict, question: str) -> dict:
@@ -522,10 +621,14 @@ def pipeline(cfg: nix.Config, run: Run, *, switch_policy: str, do_bump: bool, on
     fx = facts_mod.mine(cfg)
     (run.dir / "facts.json").write_text(facts_mod.to_json(fx))
     eval_only = False
+    gc = collect_garbage(cfg, run, fx)
+    if gc["ran"]:
+        fx = facts_mod.mine(cfg)
     short = prove.store_short(fx)
     if short is not None:
         eval_only = True
-        msg = "/nix/store has %.1f GiB free (< %.0f GiB): this run proves by evaluation only and activates nothing. Free space (nh clean / nix-collect-garbage) to resume builds." % (short, prove.MIN_STORE_FREE_GIB)
+        msg = ("ihc collected garbage and freed %.1f GiB; " % gc["freed_gib"] if gc["ran"] else "") + \
+              "/nix/store has %.1f GiB free (< %.0f GiB): this run proves by evaluation only and activates nothing. Free space (nh clean / nix-collect-garbage) to resume builds." % (short, prove.MIN_STORE_FREE_GIB)
         run.note(msg)
         notify("Disk nearly full: eval-only maintenance", msg, "critical")
         switch_policy = "never"
@@ -580,7 +683,7 @@ def pipeline(cfg: nix.Config, run: Run, *, switch_policy: str, do_bump: bool, on
     gens = prove.generation_count(cfg) if cfg.platform == "nixos" else None
     docs_result = refresh_docs_if_changed(cfg, run, fx)
 
-    run.verdict = dict(verdict.as_dict(), bumped=bumped["bumped"], blocked=bumped["blocked"], skipped=bumped["skipped"], deferred=bumped.get("deferred", {}), improved=improved, security_fix=secfix, activation=act, generations=gens, docs=docs_result, security=sec["counts"])
+    run.verdict = dict(verdict.as_dict(), bumped=bumped["bumped"], blocked=bumped["blocked"], skipped=bumped["skipped"], deferred=bumped.get("deferred", {}), gc=gc, improved=improved, security_fix=secfix, activation=act, generations=gens, docs=docs_result, security=sec["counts"])
     run.write_report()
     history_append({
         "run": run.id, "ok": verdict.ok, "bumped": bumped["bumped"], "blocked": sorted(bumped["blocked"]), "deferred": bumped.get("deferred", {}), "improved": improved,

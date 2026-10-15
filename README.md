@@ -102,6 +102,7 @@ Both modules also expose `package` and `randomizedDelay` (default `20m`).
 | `IHC_GUARDED_UNITS` | comma-separated unit names added to the guarded-units list | (unset) |
 | `IHC_NO_DESKTOP` | set to skip desktop notifications (still logged + printed to stderr) | (unset) |
 | `IHC_CVE_DAYS` | days between nightly CVE scans; `0` disables them | `7` |
+| `IHC_GC_KEEP_DAYS` | a short store is collected; generations newer than this survive | `14` |
 | `IHC_CVE_TIMEOUT` | seconds before a CVE scan is killed | `2400` |
 
 ## Verbs
@@ -358,10 +359,23 @@ those paths silently, and a "clean" scan would be a lie.
 keep the built system/home out-links that pin closures) and mines the rest for the docs:
 generation retention, unused flake inputs, commit-pinned inputs, local inputs whose content
 changed, configuration assets outside git, stale backup files, dead configuration files, and
-`/boot` pressure (it re-installs the bootloader to drop entries of deleted generations). It
-never garbage-collects, deletes profiles, or touches user data; those become queue items
-with a recommended command. MAINTENANCE.md's "System hygiene" section is the method the
-agent maintains for the host.
+`/boot` pressure (it re-installs the bootloader to drop entries of deleted generations).
+MAINTENANCE.md's "System hygiene" section is the method the agent maintains for the host.
+
+### Garbage collection
+
+When `/nix/store` drops below the free-space floor, the run collects garbage before it does
+anything else, so a full store gets repaired instead of only reported. The collection is
+bounded: `nix-collect-garbage --delete-older-than $IHC_GC_KEEP_DAYS` (14 days), for the user
+profile and, with passwordless sudo, the system profile. It is never `nix-collect-garbage -d`,
+because `-d` deletes every old generation and those generations are the rollback targets the
+proof pipeline depends on. The run reports the space it freed.
+
+A store that is still short after that is almost always pinned by profile *links* that are not
+the current generation: every `nixos-rebuild --profile-name X` keeps a whole closure alive, and
+no collection can free it however old it is. ihc lists them oldest first with their closure
+sizes and raises one pending decision. It does not delete them: somebody created each one on
+purpose as a rollback target. It also never deletes profiles or user data on its own.
 
 ## Evidence bundles
 
