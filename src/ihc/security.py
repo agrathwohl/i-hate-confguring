@@ -4,9 +4,9 @@ nixpkgs itself marks as vulnerable?
 Generic for any NixOS / nix-darwin / home-manager user. Two independent sources of truth: the user's own
 files (grep, always available, always cited) and the *effective* option values (one batched `nix eval`,
 which is the only thing that sees nixpkgs' defaults). Nothing here is host specific; host-specific accepted
-risk arrives through `## Security exceptions` in MAINTENANCE.md. Nothing here is ever fixed unattended: the
-one class `ihc security --fix` will hand to an agent is pinning an unhashed remote fetch, and every other
-finding is a decision only the user can make.
+risk arrives through `## Security exceptions` in MAINTENANCE.md. Two classes are handed to an agent, both
+behind the gates in run.py: pinning an unhashed remote fetch, and a package CISA lists as exploited in the
+wild (`tier`). Every other finding is a decision only the user can make.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -52,6 +53,9 @@ let
   pwKeys = [ "password" "initialPassword" "hashedPassword" "initialHashedPassword" ];
   getty = p [ "services" "getty" "autologinUser" ] null;
   dm = p [ "services" "displayManager" "autoLogin" "enable" ] false;
+  fw = get c [ "networking" "firewall" ] { };
+  fwIfs = let r = builtins.tryEval (builtins.attrValues (get fw [ "interfaces" ] { })); in if r.success then r.value else [ ];
+  fwList = k: builtins.concatMap (x: let v = safe (get x [ k ] [ ]); in if builtins.isList v then v else [ ]) ([ fw ] ++ fwIfs);
 in
 {
   sshd_password_auth = if sshd == true then p [ "services" "openssh" "settings" "PasswordAuthentication" ] "<<absent>>" else false;
@@ -82,6 +86,11 @@ in
   insecure_permitted = npkg "permittedInsecurePackages" [ ];
   insecure_gating_disabled = (npkg "allowInsecure" false) == true
     || (builtins.isAttrs npkgs && builtins.hasAttr "allowInsecurePredicate" npkgs);
+  # what the firewall lets in from the network; per-interface lists are folded in, trustedInterfaces are not
+  firewall_open = {
+    tcp = fwList "allowedTCPPorts"; udp = fwList "allowedUDPPorts";
+    tcp_ranges = fwList "allowedTCPPortRanges"; udp_ranges = fwList "allowedUDPPortRanges";
+  };
 }
 """
 
@@ -629,6 +638,7 @@ def report(cfg: nix.Config, fx: dict | None = None, do_probe: bool = True) -> di
             unknown += unanswered(cfg.platform, "the evaluation failed: %s" % err.splitlines()[0][:200] if err else "the evaluation failed")
         else:
             ev["ok"] = True
+            ev["values"] = values
             ef, ev_unknown = eval_findings(values, cfg.platform)
             findings = anchor_findings(_merge(findings, ef), values, files_sys, files_hm)
             findings += insecure_entry_findings(values.get("insecure_permitted") or [], files_sys + files_hm)
@@ -680,6 +690,12 @@ def summary_lines(report: dict) -> list[str]:
                           "so treat it as a triage order, not a verdict"
                           % (cve.get("scanner") or "unknown scanner", cve.get("counts", {}).get("packages", 0),
                              cve.get("counts", {}).get("cves", 0), top.get("pname", "-"), top.get("max_cvss") or 0.0))[:400])
+            kevs = [p for p in cve.get("packages") or [] if p.get("kev")]
+            if kevs:
+                lines.insert(0, ("EXPLOITED IN THE WILD (CISA KEV): " + "; ".join(
+                    "%s %s, %s" % (p["name"], ",".join(p["kev"][:2]), p.get("exposure")) for p in kevs[:3]))[:400])
+            elif cve.get("kev") and not cve["kev"]["ok"]:
+                lines.append(("exploited-in-the-wild check FAILED, so no CVE here is known to be unexploited: %s" % cve["kev"]["note"])[:400])
     return lines
 
 
@@ -711,16 +727,24 @@ def escalate(report: dict) -> str | None:
     """The only place this module raises a pending decision. One pending per distinct set of high
     findings, so an unchanged set never re-raises and the nightly cannot become a notification loop."""
     highs = [f for f in report.get("findings", []) if f["severity"] == "high"]
-    if not highs:
+    kevs = [p for p in ((report.get("cve") or {}).get("packages") or []) if p.get("kev") and not p.get("remedied")]
+    if not highs and not kevs:
         return None
-    digest = hashlib.sha256(json.dumps(sorted((f["id"], f["file"] or "") for f in highs)).encode()).hexdigest()[:12]
+    key = sorted((f["id"], f["file"] or "") for f in highs) + sorted((p["pname"], ",".join(p["kev"])) for p in kevs)
+    digest = hashlib.sha256(json.dumps(key).encode()).hexdigest()[:12]
     if any(p["kind"] == "security" and digest in p["title"] for p in pending_list()):
         return None
-    body = "\n\n".join("%s\n  %s:%s\n  %s\n  remediation: %s" % (f["title"], f["file"], f["line"], f["detail"], f["remediation"])
-                       for f in highs)
-    pending_add("security", "Security: %d high-severity finding(s) [%s]" % (len(highs), digest), body[:8000],
+    body = "\n\n".join(["%s %s: EXPLOITED IN THE WILD (CISA KEV)\n  exposure: %s %s\n  ihc tier: %s; last fix attempt: %s\n  %s" % (
+                            p["pname"], p["name"], p["exposure"], ", ".join(p.get("sockets") or []), p["tier"],
+                            p.get("fix") or "none yet (an agent tries it on the next run unless you list the CVE as an exception)",
+                            "\n  ".join(p.get("kev_notes") or p["kev"])) for p in kevs] +
+                       ["%s\n  %s:%s\n  %s\n  remediation: %s" % (f["title"], f["file"], f["line"], f["detail"], f["remediation"])
+                        for f in highs])
+    title = ("Security: %d exploited-in-the-wild package(s), %d high-severity finding(s) [%s]" % (len(kevs), len(highs), digest)
+             if kevs else "Security: %d high-severity finding(s) [%s]" % (len(highs), digest))
+    pending_add("security", title, body[:8000],
                 "Decide each one. Record what you accept under `## Security exceptions` in MAINTENANCE.md "
-                "(`- <check id>: <why it is fine here>`), then `ihc pending resolve <id>`.")
+                "(`- <check id or CVE id>: <why it is fine here>`), then `ihc pending resolve <id>`.")
     return digest
 
 
@@ -728,14 +752,14 @@ def escalate(report: dict) -> str | None:
 
 CVE_CACHE = STATE_DIR / "vulnix-cache"
 CVE_TIMEOUT = int(os.environ.get("IHC_CVE_TIMEOUT", "2400"))
-CVE_DAYS = int(os.environ.get("IHC_CVE_DAYS", "7"))
+CVE_DAYS = int(os.environ.get("IHC_CVE_DAYS", "1"))
 NVD_WINDOW_YEARS = 6
 CVE_LIMITS = [
     "Matching is by package name and version, not by vendor, so a package that merely shares a name with another product inherits its advisories: same-name matches are expected false positives.",
     "A nixpkgs backport that patches a CVE without changing the version is still reported, because the version is all the scanner compares.",
     "A CVE with no published score is reported as unscored, never as 0.0.",
     "This scans what was built, not necessarily what is running; the scanned paths are listed above.",
-    "Service reachability and exploitability are not assessed. Ranking by CVSS base score is a triage order, not a severity assessment.",
+    "Exploitation is taken from the CISA KEV catalogue, and reachability is measured only for those packages: the sockets their processes listen on, against the firewall's open ports. trustedInterfaces and ports that docker publishes past the firewall are not counted. Ranking by CVSS base score is a triage order, not a severity assessment.",
 ]
 VULNIX_LIMIT = "NVD feed coverage is a rolling 6-year window (currently %s onward): older unpatched vulnerabilities are invisible."
 
@@ -822,8 +846,6 @@ def parse_vulnxscan(csv_text: str) -> tuple[list[dict] | None, str]:
             continue
         rec["max_cvss"] = score if rec["max_cvss"] is None else max(rec["max_cvss"], score)
     out = list(by_pkg.values())
-    for rec in out:
-        rec["cves"] = rec["cves"][:20]
     out.sort(key=lambda r: (r["max_cvss"] is None, -(r["max_cvss"] or 0), -len(r["cves"])))
     return out, ""
 
@@ -848,7 +870,7 @@ def parse_vulnix(stdout: str, stderr: str, rc: int) -> tuple[list[dict] | None, 
             "derivation": rec.get("derivation"),
             "max_cvss": max(scores.values()) if scores else None,   # a CVE with no score is UNSCORED, never 0.0
             "unscored": len(affected) - len(scores),
-            "cves": affected[:20],
+            "cves": affected,
         })
     out.sort(key=lambda r: (r["max_cvss"] is None, -(r["max_cvss"] or 0), -len(r["cves"])))
     return out, ""
@@ -878,12 +900,146 @@ def deriver_coverage(targets: list[Path]) -> tuple[int, int] | None:
     return have, len(paths)
 
 
-def cve_scan(cfg: nix.Config, run: Run, targets: list[Path]) -> dict:
-    """Runs vulnix over the given store paths. Records the attempt, never a synthesised result."""
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+KEV_FILE = STATE_DIR / "kev.json"
+
+
+def kev_load(run: Run) -> tuple[dict | None, str]:
+    """CISA's catalogue of CVEs exploited in the wild, downloaded at most once a day.
+    (None, why) when it could not be read: an unknown is never reported as "nothing exploited"."""
+    if not (KEV_FILE.exists() and time.time() - KEV_FILE.stat().st_mtime < 86400):
+        part = KEV_FILE.with_suffix(".part")
+        st = run.step("cve-kev", ["curl", "-fsSL", "--max-time", "120", "-o", str(part), KEV_URL])
+        if not st.ok:
+            return None, "the CISA KEV download failed: %s" % (st.tail(3) or "exit %d" % st.exit)
+        part.replace(KEV_FILE)
+    try:
+        data = json.loads(KEV_FILE.read_text())
+    except (OSError, ValueError) as exc:
+        return None, "the CISA KEV catalogue did not parse: %s" % exc
+    kev = {v["cveID"]: v for v in data.get("vulnerabilities") or [] if isinstance(v, dict) and v.get("cveID")}
+    return kev, "CISA KEV %s, %d entries" % (data.get("catalogVersion"), len(kev))
+
+
+def listeners(ss_out: str) -> list[dict]:
+    """Pure. `ss -H -tulpn` rows -> the sockets bound to an address other than loopback."""
+    out = []
+    for line in ss_out.splitlines():
+        f = line.split()
+        if len(f) < 5 or f[0] not in ("tcp", "udp"):
+            continue
+        addr, _, port = f[4].rpartition(":")
+        addr = addr.split("%")[0].strip("[]")
+        if not port.isdigit() or addr == "::1" or addr.startswith("127."):
+            continue
+        out.append({"proto": f[0], "addr": addr, "port": int(port), "pids": sorted({int(p) for p in re.findall(r"pid=(\d+)", line)})})
+    return out
+
+
+def open_port(sock: dict, fw_enable, fw_open) -> bool | None:
+    """Pure. Does the firewall let the network reach this socket? None = not known."""
+    if fw_enable is False:
+        return True
+    if fw_enable is not True or not isinstance(fw_open, dict):
+        return None
+    port = sock["port"]
+    return port in (fw_open.get(sock["proto"]) or []) or any(
+        isinstance(r, dict) and r.get("from", 1) <= port <= r.get("to", 0) for r in fw_open.get(sock["proto"] + "_ranges") or [])
+
+
+def pname(store_name: str) -> str:
+    """Nix's parseDrvName: the version starts at the first dash that a digit follows."""
+    m = re.search(r"-(?=\d)", store_name)
+    return store_name[:m.start()] if m else store_name
+
+
+def mapped(grep_out: str) -> dict[int, set[str]]:
+    """Pure. `grep -oH /nix/store/... /proc/<pid>/maps` -> pid -> names of the packages it has loaded."""
+    out: dict[int, set[str]] = {}
+    for m in re.finditer(r"^/proc/(\d+)/maps:/nix/store/[0-9a-z]{32}-(.+)$", grep_out, re.M):
+        out.setdefault(int(m.group(1)), set()).add(pname(m.group(2)))
+    return out
+
+
+def exposure(cfg: nix.Config, run: Run, probe_values: dict | None) -> tuple[dict[str, dict], str]:
+    """Which packages a process that accepts connections from off this machine has loaded:
+    pname -> {"level": "reachable" (the firewall lets the port in) | "listening", "sockets": [...]}.
+    Linux only, and it needs `sudo -n` to see other users' processes."""
+    if cfg.platform == "darwin":
+        return {}, "exposure is measured with ss and /proc, which macOS does not have"
+    st = run.step("cve-listeners", ["ss", "-H", "-tulpn"], sudo=True)
+    if not st.ok:
+        return {}, "ss failed, so exposure is unknown: %s" % (st.tail(3) or "exit %d" % st.exit)
+    socks = listeners(st.out)
+    pids = sorted({p for s in socks for p in s["pids"]})
+    if not pids:
+        return {}, ""
+    # grep exits 2 when one of the processes ended meanwhile; the rest of its output still stands
+    g = run.step("cve-mapped", ["grep", "-oH", "/nix/store/[^/ ]*"] + ["/proc/%d/maps" % p for p in pids], sudo=True)
+    loaded = mapped(g.out)
+    if not loaded:
+        return {}, "reading /proc/<pid>/maps failed, so exposure is unknown: %s" % (g.tail(3) or "exit %d" % g.exit)
+    vals = probe_values or {}
+    out: dict[str, dict] = {}
+    for s in socks:
+        reach = open_port(s, vals.get("firewall_enable"), vals.get("firewall_open"))
+        for pid in s["pids"]:
+            for name in loaded.get(pid, ()):
+                e = out.setdefault(name, {"level": "listening", "sockets": []})
+                if reach:
+                    e["level"] = "reachable"
+                e["sockets"].append("%s %s:%d" % (s["proto"], s["addr"], s["port"]))
+    return out, ""
+
+
+def tier(pkg: dict) -> str | None:
+    """How far ihc may go unattended for one scanned package; None = report only.
+
+    "upgrade":  CISA lists one of its CVEs as exploited in the wild. A fixed build of the same package
+                is allowed (a newer upstream release, the upstream patch, a dependency graft); nothing
+                else about the system may change.
+    "mitigate": exploited in the wild AND loaded by a process the network can reach through the
+                firewall. If no fixed build exists, the exposure itself may be closed. This is the only
+                tier allowed to change what the system does, so it needs both conditions.
+    """
+    if not pkg.get("kev"):
+        return None
+    return "mitigate" if pkg.get("exposure") == "reachable" else "upgrade"
+
+
+def cve_task(pkgs: list[dict]) -> str:
+    """The task text for `run.fix_loop` for the packages `tier` selected."""
+    rows = ["- %s (built as %s; tier %s; exposure %s%s):\n    %s" % (
+        p["pname"], p["name"], p["tier"], p["exposure"], " via " + ", ".join(p["sockets"]) if p.get("sockets") else "",
+        "\n    ".join(p.get("kev_notes") or p["kev"])) for p in pkgs]
+    return "\n".join([
+        "CISA lists these vulnerabilities as exploited in the wild, and this configuration builds a version "
+        "of the package that a scanner matched to them:", *rows,
+        "The match was by package name and version only. First find out whether each one applies: read the "
+        "CVE's affected versions and the patches the nixpkgs derivation already carries. If the build is not "
+        "affected, or nixpkgs already has the fix, change nothing for it and say NOT AFFECTED with the evidence.",
+        "Tier upgrade: the fix must not change what the system does. Allowed: a newer upstream release of the "
+        "same package (overrideAttrs on src and version), the upstream fix as a patch (fetchpatch with its hash), "
+        "or, for a library many packages link, `system.replaceDependencies.replacements` so that its dependents "
+        "are not rebuilt. For the kernel, only a patch on the kernel this configuration already uses "
+        "(boot.kernelPatches). Not allowed: another kernel package or kernel config, kernel parameters, "
+        "disabling or rebinding a service, firewall changes, removing a package.",
+        "Tier mitigate: a host on the network can reach the vulnerable process. Use the upgrade route if a fixed "
+        "build exists. Only if none exists, also remove the exposure with the least disruptive change that "
+        "removes it: bind the service to localhost, or close its firewall port, or as the last resort stop the "
+        "service. Never touch ssh or its port: a remote lockout is worse than the vulnerability. Put a comment "
+        "on the change that names the CVE, so it can be undone when nixpkgs ships the fix.",
+        "Change nothing that GOALS.md lists as an invariant. Prove it by evaluating both attributes.",
+    ])
+
+
+def cve_scan(cfg: nix.Config, run: Run, targets: list[Path], probe_values: dict | None = None) -> dict:
+    """Runs the scanner over the given store paths, then marks what CISA lists as exploited in the wild
+    and how exposed each such package is. Records the attempt, never a synthesised result."""
     at = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     out: dict = {"available": False, "reason": None, "tool": None, "scanned": [str(t) for t in targets],
-                 "packages": [], "counts": {"packages": 0, "cves": 0}, "deriver_coverage": None,
-                 "limits": cve_limits(), "at": at, "scanner": None}
+                 "packages": [], "counts": {"packages": 0, "cves": 0, "exploited": 0}, "deriver_coverage": None,
+                 "limits": cve_limits(), "at": at, "scanner": None, "kev": None, "exposure": None}
     if not targets:
         out["reason"] = "nothing to scan: no built system or home-manager path was given"
         return out
@@ -914,12 +1070,27 @@ def cve_scan(cfg: nix.Config, run: Run, targets: list[Path]) -> dict:
         if packages is None:
             reason = err
             continue
-        packages.sort(key=lambda r: (r["max_cvss"] is None, -(r["max_cvss"] or 0), -len(r["cves"])))
+        kev, note = kev_load(run)
+        out["kev"] = {"ok": kev is not None, "note": note}
+        excepted = docs.security_exceptions(cfg.docs_dir)
+        for p in packages:
+            p["kev"] = sorted(c for c in p["cves"] if c in (kev or {}) and c not in excepted)
+            p["kev_notes"] = ["%s (CISA added %s): %s. %s" % (c, kev[c].get("dateAdded"), kev[c].get("vulnerabilityName"),
+                                                               (kev[c].get("shortDescription") or "")[:300]) for c in p["kev"]]
+        measured = any(p["kev"] for p in packages)
+        expo, out["exposure"] = exposure(cfg, run, probe_values) if measured else ({}, "measured only for exploited-in-the-wild packages")
+        default = ("unknown" if out["exposure"] else "none") if measured else "not measured"
+        for p in packages:
+            e = expo.get(p["pname"]) or {}
+            p["exposure"], p["sockets"] = e.get("level", default), sorted(set(e.get("sockets", [])))[:5]
+            p["tier"] = tier(p)
+        packages.sort(key=lambda r: (not r["kev"], r["max_cvss"] is None, -(r["max_cvss"] or 0), -len(r["cves"])))
         cov = deriver_coverage(targets)
         out.update({
             "available": True, "reason": None, "tool": argv, "scanner": tool, "limits": cve_limits(tool),
-            "packages": packages[:40],
-            "counts": {"packages": len(packages), "cves": sum(len(p["cves"]) for p in packages)},
+            "packages": [dict(p, cves=p["cves"][:20]) for p in packages[:40]],
+            "counts": {"packages": len(packages), "cves": sum(len(p["cves"]) for p in packages),
+                       "exploited": sum(1 for p in packages if p["kev"])},
             "deriver_coverage": round(cov[0] / cov[1], 3) if cov and cov[1] else None,
         })
         return out

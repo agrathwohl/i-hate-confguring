@@ -19,7 +19,8 @@
         pkgs.findutils
         pkgs.util-linux
         pkgs.libnotify
-      ];
+        pkgs.curl
+      ] ++ nixpkgs.lib.optional pkgs.stdenv.isLinux pkgs.iproute2;
 
       execStart = cfg:
         "${cfg.package}/bin/ihc run"

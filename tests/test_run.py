@@ -435,3 +435,48 @@ class CollectGarbageTests(unittest.TestCase):
         self.assertNotIn(live, [r["target"] for r in rows])
         for r in rows:
             self.assertGreaterEqual(r["days"], 0)
+
+
+class AskAgentDidNotFinishTests(unittest.TestCase):
+    def test_unfinished_edits_are_reverted_and_kept_as_a_diff(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from ihc import agent, nix, run as run_mod, store
+        seen = {}
+        with tempfile.TemporaryDirectory() as d:
+            cfg = nix.Config("nixos", Path(d), "h", "u", None, True, [], [], "h", "u", Path(d))
+            with patch.object(store, "RUNS_DIR", Path(d) / "runs"), patch.object(store, "STATE_DIR", Path(d)), \
+                 patch.object(store, "PENDING_DIR", Path(d) / "p"), \
+                 patch.object(run_mod.facts_mod, "summary_lines", lambda f: ["fact"]), \
+                 patch.object(agent, "run_agent", lambda c, r, p: (None, False, "ihc: timeout after 3600s (process group killed)")), \
+                 patch.object(agent, "changed_files", lambda c: ["gpu-unlock.nix"]), \
+                 patch.object(agent, "diff_text", lambda c: "+ half-done"), \
+                 patch.object(agent, "revert", lambda c, r: seen.__setitem__("reverted", True)):
+                run = store.new_run("ask")
+                res = run_mod.ask(cfg, run, {}, "set it up")
+                self.assertEqual((run.dir / "unfinished.diff").read_text(), "+ half-done")
+        self.assertEqual(res["verdict"], "UNSOLVED")
+        self.assertTrue(seen.get("reverted"))
+        self.assertIn("timeout", res["detail"])
+        self.assertIn("reverted", res["detail"])
+        self.assertNotIn("no usable agent", res["detail"])
+
+    def test_nothing_to_revert_when_the_agent_changed_nothing(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from ihc import agent, nix, run as run_mod, store
+        seen = {}
+        with tempfile.TemporaryDirectory() as d:
+            cfg = nix.Config("nixos", Path(d), "h", "u", None, True, [], [], "h", "u", Path(d))
+            with patch.object(store, "RUNS_DIR", Path(d) / "runs"), patch.object(store, "STATE_DIR", Path(d)), \
+                 patch.object(store, "PENDING_DIR", Path(d) / "p"), \
+                 patch.object(run_mod.facts_mod, "summary_lines", lambda f: ["fact"]), \
+                 patch.object(agent, "run_agent", lambda c, r, p: (None, False, "no usable agent")), \
+                 patch.object(agent, "changed_files", lambda c: []), \
+                 patch.object(agent, "revert", lambda c, r: seen.__setitem__("reverted", True)):
+                run = store.new_run("ask")
+                res = run_mod.ask(cfg, run, {}, "x")
+        self.assertEqual(res["verdict"], "UNSOLVED")
+        self.assertNotIn("reverted", seen)

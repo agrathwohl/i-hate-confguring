@@ -101,7 +101,7 @@ Both modules also expose `package` and `randomizedDelay` (default `20m`).
 | `IHC_MIN_STORE_FREE_GIB` | `/nix/store` free-space floor before builds are refused | `10` |
 | `IHC_GUARDED_UNITS` | comma-separated unit names added to the guarded-units list | (unset) |
 | `IHC_NO_DESKTOP` | set to skip desktop notifications (still logged + printed to stderr) | (unset) |
-| `IHC_CVE_DAYS` | days between nightly CVE scans; `0` disables them | `7` |
+| `IHC_CVE_DAYS` | days between nightly CVE scans; `0` disables them | `1` |
 | `IHC_GC_KEEP_DAYS` | a short store is collected; generations newer than this survive | `14` |
 | `IHC_CVE_TIMEOUT` | seconds before a CVE scan is killed | `2400` |
 
@@ -121,7 +121,7 @@ Both modules also expose `package` and `randomizedDelay` (default `20m`).
 | `docs check\|regen` | `--dir PATH` | check `GOALS.md`/`MAINTENANCE.md` citations, or regenerate them with an agent (unconditionally) |
 | `notify` | `TITLE [BODY]`, `-u/--urgency`, `-q/--quiet` | send a desktop notification (and log it) |
 | `pending list\|resolve` | `[ID]` | decisions that need you |
-| `security` | `--json`, `--fix`, `--cve`, `--max-attempts N` | what grants privilege, exposes a credential, or is known-vulnerable; `--fix` pins unhashed remote fetches (the one class ihc will hand to an agent, and only when you ask), `--cve` for a vulnix closure scan |
+| `security` | `--json`, `--fix`, `--cve`, `--max-attempts N` | what grants privilege, exposes a credential, or is known-vulnerable; `--fix` pins unhashed remote fetches (the one class ihc will hand to an agent, and only when you ask), `--cve` for a closure CVE scan with exploited-in-the-wild marking |
 | `mcp` | | serve a subset of the verbs over MCP stdio |
 
 `--flake DIR` is a global flag on every verb (default: `$IHC_FLAKE` or autodetect).
@@ -139,14 +139,15 @@ Both modules also expose `package` and `randomizedDelay` (default `20m`).
 6. A final `check` — the last bump's verdict is reused when nothing invalidated it; otherwise
    (always when `--improve` changed something) a fresh proof runs, with a fix-loop attempt on
    failure.
-7. Activate per the switch policy (home-manager first, then system). After a successful switch,
+7. When a CVE scan is due (`IHC_CVE_DAYS`, every run by default), scan the proved closures, mark what
+   CISA lists as exploited in the wild, and hand those packages to the agent only as far as their
+   exposure allows (see [Exploited in the wild](#exploited-in-the-wild)); a proven fix is what gets
+   activated. Then activate per the switch policy (home-manager first, then system). After a successful switch,
    an agent reviews it — what changed, unit/journal state, program checks — fixes a real
    regression, re-proves, and re-activates home-manager (a system-side fix is proved but left
    for the next run to activate).
-8. Run the security report against the final tree, write it to `<run>/security.json`, and raise one
-   pending decision if the set of high-severity findings changed. The run never edits anything
-   security-related — not even the auto-remediable class — so a rolling channel it flagged cannot be
-   pinned behind your back. A CVE scan runs here at most every `IHC_CVE_DAYS` days.
+8. Write the security report to `<run>/security.json`, and raise one pending decision if the set of
+   high-severity findings or exploited-in-the-wild packages changed.
 9. Record the system generation count; regenerate `GOALS.md`/`MAINTENANCE.md` if the mined-facts
    fingerprint changed since the last regeneration; write the report, append to history
    (telemetry), and send a notification.
@@ -282,12 +283,14 @@ nightly is working never sees it).
 
 ### What gets fixed and what does not
 
-Exactly one class of finding is ever handed to an agent, by `ihc security --fix` and by the nightly:
+Two classes of finding are ever handed to an agent:
 
 - an unhashed `builtins.fetchTarball` / `fetchurl` / `fetchGit`, pinned to the content it already
-  resolves to today, so a rebuild cannot silently execute different code. It runs under the normal
-  proof harness (evaluate, build, dry-activate, closure diff) and is revertible; if the fix does not
-  prove, the harness reverts it and the finding stays reported.
+  resolves to today, so a rebuild cannot silently execute different code (`ihc security --fix` and
+  the nightly). It runs under the normal proof harness (evaluate, build, dry-activate, closure diff)
+  and is revertible; if the fix does not prove, the harness reverts it and the finding stays reported.
+- a package CISA lists as exploited in the wild, by the nightly only, and only as far as its exposure
+  allows — see [Exploited in the wild](#exploited-in-the-wild).
 
 Everything else — ssh, the firewall, sudo, users, groups, secrets wiring, an insecure-package permit —
 is reported and raises a pending decision, and is never edited for you. Those are the changes that can
@@ -341,10 +344,10 @@ order and reports which one answered:
    error rather than an empty list.
 
 Either way ihc runs the scanner as a subprocess — from `PATH`, else from your own locked nixpkgs via
-`nix shell --inputs-from`, else from the registry. The nightly run scans at most every `IHC_CVE_DAYS`
-days (default 7) and skips it when the store is short on space or the run is out of time. It is not
-nightly on purpose: a full closure scan takes many minutes and needs the network, so on a laptop that
-wakes without one it simply fails, and a failure is reported as a failure.
+`nix shell --inputs-from`, else from the registry. The nightly run scans every `IHC_CVE_DAYS` days
+(default 1: every run) and skips it when the store is short on space or the run is out of time. A
+full closure scan takes several minutes and needs the network, so on a laptop that wakes without one
+it fails, and a failure is reported as a failure.
 
 Read the result as a triage order, not a verdict, and ihc says so in every report: a scanner matches
 on package name and version, so a package that merely shares a name with something else inherits its
@@ -352,6 +355,29 @@ CVEs; a CVE with no score is reported as unscored, never as 0.0; and it scans wh
 necessarily what is running — ihc lists the exact store paths it scanned. It also reports how many
 paths in the closure still have a deriver: if derivations have been garbage-collected, a scanner skips
 those paths silently, and a "clean" scan would be a lie.
+
+### Exploited in the wild
+
+A CVSS score says how bad a bug could be, not that anyone uses it, and a name-and-version scan of a
+desktop closure matches hundreds of old CVEs that nixpkgs has long patched. So ihc acts only on the
+CVEs CISA's [Known Exploited Vulnerabilities catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)
+lists (downloaded at most once a day). Everything else waits for the nightly bump to pull the fix in.
+
+For each exploited package ihc measures exposure: which listening processes (`ss -tulpn`) have the
+package loaded (`/proc/<pid>/maps`), and whether the firewall's evaluated open ports let them be
+reached. That sets how far the agent may go:
+
+| Exploited in the wild | Reachable through the firewall | The agent may |
+|---|---|---|
+| no | — | do nothing; the nightly bump picks up the fix when nixpkgs ships it |
+| yes | no | build a fixed version of the same package — a newer upstream release, the upstream patch, or a `system.replaceDependencies` graft for a widely linked library — and nothing else: no service, port, kernel or behaviour change |
+| yes | yes | do the same; only if no fixed build exists, also close the exposure (bind to localhost, close the port, or as the last resort stop the service), with a comment naming the CVE. Never ssh |
+
+The agent first checks whether the build is really affected — the match is by name and version — and
+changes nothing if it is not. The three gates above apply, and a CVE id listed under
+`## Security exceptions` is never acted on. A mitigation stays in your pending list after it lands,
+because it changed what the system does. Exposure is measured on Linux with `sudo -n`; trusted
+interfaces and ports that docker publishes past the firewall are not counted.
 
 ## Hygiene
 

@@ -654,20 +654,48 @@ class CveScanWiringTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.cfgdir, ignore_errors=True)
         self.cfg = make_config(self.cfgdir)
 
-    def scan(self, script: str) -> dict:
+    def scan(self, script: str, kev=({}, "CISA KEV test, 0 entries"), expo=({}, "")) -> dict:
         run = store.new_run("security")
         argv = [[sys.executable, "-c", script]]
         # Patch the chain cve_scan actually calls. Patching vulnix_argv alone left the real
         # `nix shell nixpkgs#sbomnix` forms running: they hit the network and the test was flaky.
         with mock.patch.object(security, "scanner_argv", lambda cfg, out_csv: argv), \
-             mock.patch.object(security, "deriver_coverage", lambda targets: None):
+             mock.patch.object(security, "deriver_coverage", lambda targets: None), \
+             mock.patch.object(security, "kev_load", lambda run: kev), \
+             mock.patch.object(security, "exposure", lambda cfg, run, values: expo):
             return security.cve_scan(self.cfg, run, [self.cfgdir])
+
+    TWO = ('import sys; sys.stdout.write(\'[{"pname": "openssl", "name": "openssl-3.0.1", "affected_by": ["CVE-2"], '
+           '"cvssv3_basescore": {"CVE-2": 9.8}}, {"pname": "php", "name": "php-8.5.12", '
+           '"affected_by": ["CVE-K", "CVE-3"], "cvssv3_basescore": {"CVE-K": 5.0}}]\')')
+    KEV = {"CVE-K": {"cveID": "CVE-K", "dateAdded": "2026-10-26", "vulnerabilityName": "PHP RCE", "shortDescription": "d"}}
+
+    def test_an_exploited_cve_sorts_first_and_gets_a_tier_from_its_exposure(self):
+        out = self.scan(self.TWO, kev=(self.KEV, "CISA KEV x, 1 entries"),
+                        expo=({"php": {"level": "reachable", "sockets": ["tcp 0.0.0.0:80"]}}, ""))
+        php, openssl = out["packages"]
+        self.assertEqual((php["pname"], php["kev"], php["exposure"], php["tier"]), ("php", ["CVE-K"], "reachable", "mitigate"))
+        self.assertIn("PHP RCE", php["kev_notes"][0])
+        self.assertEqual((openssl["kev"], openssl["tier"]), ([], None))
+        self.assertEqual(out["counts"]["exploited"], 1)
+        self.assertTrue(security.summary_lines({"findings": [], "counts": {}, "cve": out})[0].startswith("EXPLOITED IN THE WILD"))
+
+    def test_a_cve_listed_as_an_exception_is_never_exploited_here(self):
+        (self.cfgdir / "MAINTENANCE.md").write_text("## Security exceptions\n\n- CVE-K: our build is not affected\n")
+        out = self.scan(self.TWO, kev=(self.KEV, "CISA KEV x, 1 entries"))
+        self.assertEqual([p["kev"] for p in out["packages"]], [[], []])
+        self.assertEqual(out["counts"]["exploited"], 0)
+
+    def test_a_failed_kev_download_is_a_failure_never_nothing_exploited(self):
+        out = self.scan(self.TWO, kev=(None, "the CISA KEV download failed: 404"))
+        self.assertEqual(out["kev"], {"ok": False, "note": "the CISA KEV download failed: 404"})
+        self.assertTrue(any("FAILED" in x for x in security.summary_lines({"findings": [], "counts": {}, "cve": out})))
 
     def test_a_real_step_carries_the_scan_through(self):
         out = self.scan('import sys; sys.stdout.write(\'[{"pname": "openssl", "name": "openssl-3.0.1", '
                         '"affected_by": ["CVE-1"], "cvssv3_basescore": {"CVE-1": 9.8}}]\')')
         self.assertTrue(out["available"], out["reason"])
-        self.assertEqual(out["counts"], {"packages": 1, "cves": 1})
+        self.assertEqual(out["counts"], {"packages": 1, "cves": 1, "exploited": 0})
         self.assertEqual(out["packages"][0]["max_cvss"], 9.8)
         self.assertEqual((security.STATE_DIR / "cve-last").read_text().strip(), out["at"])
 
@@ -909,3 +937,126 @@ class VulnxscanParseTests(unittest.TestCase):
         first_vulnix = next(i for i, a in enumerate(chain) if "vulnix" in a)
         self.assertLess(first_vulnxscan, first_vulnix)
         self.assertIn("/tmp/out.csv", chain[0])
+
+
+class ExposureTests(unittest.TestCase):
+    """What decides how far ihc may go for an exploited package: the socket, the firewall, the process."""
+
+    SS = ("udp UNCONN 0 0 0.0.0.0:41641 0.0.0.0:* users:((\".tailscaled-wra\",pid=2086,fd=20))\n"
+          "udp UNCONN 0 0 127.0.0.1:123 0.0.0.0:* users:((\"ntpd\",pid=1203,fd=18))\n"
+          "tcp LISTEN 0 4096 [::1]:8080 [::]:* users:((\".php-wrapped\",pid=1263,fd=4))\n"
+          "tcp LISTEN 0 128 [::]:22 [::]:* users:((\"sshd\",pid=900,fd=3),(\"systemd\",pid=1,fd=50))\n"
+          "udp UNCONN 0 0 [fe80::1]%vetha038a5b:123 [::]:* users:((\"ntpd\",pid=1203,fd=28))\n")
+
+    def test_loopback_sockets_are_not_exposure(self):
+        socks = security.listeners(self.SS)
+        self.assertEqual([(s["proto"], s["addr"], s["port"], s["pids"]) for s in socks],
+                         [("udp", "0.0.0.0", 41641, [2086]), ("tcp", "::", 22, [1, 900]), ("udp", "fe80::1", 123, [1203])])
+
+    def test_the_firewall_decides_reachability_and_unknown_stays_unknown(self):
+        fw = {"tcp": [22], "udp": [], "tcp_ranges": [], "udp_ranges": [{"from": 60000, "to": 61000}]}
+        self.assertIs(security.open_port({"proto": "tcp", "port": 22}, True, fw), True)
+        self.assertIs(security.open_port({"proto": "udp", "port": 60001}, True, fw), True)
+        self.assertIs(security.open_port({"proto": "udp", "port": 41641}, True, fw), False)
+        self.assertIs(security.open_port({"proto": "udp", "port": 41641}, False, fw), True)
+        self.assertIsNone(security.open_port({"proto": "tcp", "port": 22}, "<<absent>>", fw))
+
+    def test_loaded_store_paths_become_package_names(self):
+        out = security.mapped("/proc/1263/maps:/nix/store/%s-php-8.5.12\n/proc/1263/maps:/nix/store/%s-glibc-2.40-66\n"
+                              "/proc/9/maps:/nix/store/%s-python3.14-redis-8.1.0\n" % ("a" * 32, "b" * 32, "c" * 32))
+        self.assertEqual(out, {1263: {"php", "glibc"}, 9: {"python3.14-redis"}})
+
+    def test_only_exploited_and_reachable_may_change_behaviour(self):
+        self.assertIsNone(security.tier({"kev": [], "exposure": "reachable"}))
+        self.assertEqual(security.tier({"kev": ["CVE-K"], "exposure": "listening"}), "upgrade")
+        self.assertEqual(security.tier({"kev": ["CVE-K"], "exposure": "unknown"}), "upgrade")
+        self.assertEqual(security.tier({"kev": ["CVE-K"], "exposure": "reachable"}), "mitigate")
+
+    def test_the_task_forbids_behaviour_changes_below_the_bar_and_ssh_always(self):
+        task = security.cve_task([{"pname": "php", "name": "php-8.5.12", "tier": "upgrade", "exposure": "none",
+                                   "sockets": [], "kev": ["CVE-K"], "kev_notes": ["CVE-K (CISA added x): PHP RCE. d"]}])
+        self.assertIn("NOT AFFECTED", task)
+        self.assertIn("PHP RCE", task)
+        self.assertIn("Never touch ssh", task)
+
+
+class ExploitedEscalationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ihc-security-kev-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = mock.patch.object(store, "PENDING_DIR", self.tmp / "pending")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def pkg(self, **over):
+        return dict({"pname": "php", "name": "php-8.5.12", "kev": ["CVE-K"], "exposure": "none", "sockets": [],
+                     "tier": "upgrade", "kev_notes": []}, **over)
+
+    def test_an_exploited_package_escalates_once(self):
+        rep = {"findings": [], "cve": {"packages": [self.pkg()]}}
+        self.assertIsNotNone(security.escalate(rep))
+        self.assertIsNone(security.escalate(rep))
+        self.assertIn("exploited-in-the-wild", store.pending_list()[0]["title"])
+
+    def test_a_proven_upgrade_does_not_escalate(self):
+        self.assertIsNone(security.escalate({"findings": [], "cve": {"packages": [self.pkg(remedied=True)]}}))
+
+
+class CveRemediateTests(unittest.TestCase):
+    """run.cve_remediate: only tiered, due packages reach the agent; a mitigation stays escalated."""
+
+    def _run(self, packages, due, verdict_ok=True, changed=True):
+        from ihc import agent, prove, run as run_mod
+        seen = {}
+        with tempfile.TemporaryDirectory() as d:
+            cfg = nix.Config("nixos", Path(d), "h", "u", None, True, [], [], "h", "u", Path(d))
+            gate = run_mod.store.security_due if due is None else (lambda k, g, b: (k in due, "first sighting"))
+            with mock.patch.object(store, "RUNS_DIR", Path(d) / "runs"), mock.patch.object(store, "STATE_DIR", Path(d)), \
+                 mock.patch.object(store, "SECURITY_STATE", Path(d) / "s.json"), \
+                 mock.patch.object(run_mod.store, "security_due", gate), \
+                 mock.patch.object(run_mod.store, "security_attempted", lambda k, ok: seen.__setitem__(k, ok)), \
+                 mock.patch.object(run_mod, "fix_loop", lambda *a, **k: seen.setdefault("task", a[5]) and prove.Verdict(ok=verdict_ok, system_path="/nix/store/x")), \
+                 mock.patch.object(agent, "changed_files", lambda c: ["a.nix"] if changed else []), \
+                 mock.patch.object(agent, "revert", lambda c, r: seen.__setitem__("reverted", True)), \
+                 mock.patch.object(run_mod, "commit_drift", lambda *a, **k: []):
+                return run_mod.cve_remediate(cfg, store.new_run("t"), {}, {"packages": packages}, 2), seen
+
+    def pkg(self, tier, **over):
+        return dict({"pname": "php", "name": "php-8.5.12", "kev": ["CVE-K"], "exposure": "none", "sockets": [],
+                     "tier": tier, "kev_notes": []}, **over)
+
+    def test_untiered_packages_never_reach_the_agent(self):
+        out, seen = self._run([self.pkg(None, kev=[])], {"cve:php:"})
+        self.assertFalse(out["attempted"])
+        self.assertNotIn("task", seen)
+
+    def test_first_sighting_is_held(self):
+        out, seen = self._run([self.pkg("upgrade")], set())
+        self.assertFalse(out["attempted"])
+        self.assertIn("first sighting", out["held"][0])
+
+    def test_a_package_listed_twice_cannot_pass_the_first_sighting_gate_in_one_run(self):
+        out, seen = self._run([self.pkg("upgrade"), self.pkg("upgrade")], None)
+        self.assertFalse(out["attempted"])
+        self.assertEqual(len(out["held"]), 1)
+        self.assertNotIn("task", seen)
+
+    def test_a_proven_upgrade_is_activated_and_closed(self):
+        p = self.pkg("upgrade")
+        out, seen = self._run([p], {"cve:php:CVE-K"})
+        self.assertTrue(out["fixed"])
+        self.assertEqual(out["verdict"].system_path, "/nix/store/x")
+        self.assertIs(seen["cve:php:CVE-K"], True)
+        self.assertTrue(p["remedied"])
+
+    def test_a_proven_mitigation_stays_in_front_of_the_user(self):
+        p = self.pkg("mitigate", exposure="reachable")
+        out, _ = self._run([p], {"cve:php:CVE-K"})
+        self.assertTrue(out["fixed"])
+        self.assertFalse(p["remedied"])
+
+    def test_a_failed_proof_reverts_and_is_not_activated(self):
+        out, seen = self._run([self.pkg("upgrade")], {"cve:php:CVE-K"}, verdict_ok=False)
+        self.assertFalse(out["fixed"])
+        self.assertNotIn("verdict", out)
+        self.assertTrue(seen.get("reverted"))

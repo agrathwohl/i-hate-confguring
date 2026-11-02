@@ -467,21 +467,61 @@ def security_fix(cfg: nix.Config, run: Run, fx: dict, max_attempts: int) -> dict
         return out
     out["attempted"] = True
     run.note("security auto-fix: %d finding(s) due" % len(due))
+    out["fixed"], out["reason"], _ = _prove_fix(cfg, run, fx, task, [finding_key(f) for f in due],
+                                                ", ".join(sorted({f["id"] for f in due})), max_attempts)
+    run.note("security auto-fix: " + out["reason"])
+    return out
+
+
+def _prove_fix(cfg: nix.Config, run: Run, fx: dict, task: str, keys: list[str], what: str, max_attempts: int) -> tuple[bool, str, prove.Verdict]:
+    """One gated security task through the agent and the proof; kept only if it proves."""
     verdict = fix_loop(cfg, run, fx, prove.Verdict(ok=False, failed_step="security", failed_target="all"),
                        max_attempts, task, "all", False)
     changed = bool(agent.changed_files(cfg))
-    out["fixed"] = bool(verdict.ok and changed)
-    for f in due:
-        store.security_attempted(finding_key(f), out["fixed"])
-    if out["fixed"]:
-        commit_drift(cfg, run, "security: fix %s (agent)" % ", ".join(sorted({f["id"] for f in due}))[:60])
-        out["reason"] = "fixed %s" % ", ".join(sorted({f["id"] for f in due}))
-    elif changed:
+    fixed = bool(verdict.ok and changed)
+    for k in keys:
+        store.security_attempted(k, fixed)
+    if fixed:
+        commit_drift(cfg, run, "security: fix %s (agent)" % what[:60])
+        return True, "fixed %s" % what, verdict
+    if changed:
         agent.revert(cfg, run)
-        out["reason"] = "the proof failed at %s; reverted" % (verdict.failed_step or "?")
-    else:
-        out["reason"] = "the agent changed nothing (it may have judged the finding deliberate)"
-    run.note("security auto-fix: " + out["reason"])
+        return False, "the proof failed at %s; reverted" % (verdict.failed_step or "?"), verdict
+    return False, "the agent changed nothing (it may have judged the finding deliberate, or the build not affected)", verdict
+
+
+def cve_key(p: dict) -> str:
+    return "cve:%s:%s" % (p["pname"], ",".join(p["kev"]))
+
+
+def cve_remediate(cfg: nix.Config, run: Run, fx: dict, cve: dict | None, max_attempts: int) -> dict:
+    """Act on the packages the scan marked as exploited in the wild, only as far as `security.tier`
+    allows, behind the same gates as security_fix. A proven fix's verdict is returned for activation."""
+    out: dict = {"attempted": False, "fixed": False, "reason": "", "held": []}
+    due, seen = [], set()
+    for p in (cve or {}).get("packages") or []:
+        # one gate check per key: a second record of the same package would pass the first-sighting gate
+        if not p.get("tier") or cve_key(p) in seen:
+            continue
+        seen.add(cve_key(p))
+        ok, why = store.security_due(cve_key(p), SECURITY_GRACE_DAYS, SECURITY_BACKOFF_DAYS)
+        (due if ok else out["held"]).append(p if ok else "%s %s: %s" % (p["pname"], ",".join(p["kev"]), why))
+    if out["held"]:
+        run.note("exploited-in-the-wild fix held: " + "; ".join(out["held"])[:400])
+    if not due:
+        out["reason"] = "nothing due"
+        return out
+    out["attempted"] = True
+    what = ", ".join("%s (%s)" % (p["pname"], ",".join(p["kev"])) for p in due)
+    run.note("exploited-in-the-wild fix (%s): %s" % ("/".join(sorted({p["tier"] for p in due})), what))
+    out["fixed"], out["reason"], verdict = _prove_fix(cfg, run, fx, security.cve_task(due), [cve_key(p) for p in due], what, max_attempts)
+    for p in due:
+        p["fix"] = out["reason"]
+        # a mitigation changed what the system does, so it stays in front of the user
+        p["remedied"] = out["fixed"] and p["tier"] == "upgrade"
+    if out["fixed"]:
+        out["verdict"] = verdict
+    run.note("exploited-in-the-wild fix: " + out["reason"])
     return out
 
 
@@ -591,7 +631,13 @@ def ask(cfg: nix.Config, run: Run, fx: dict, question: str) -> dict:
     prompt = agent.ask_prompt(cfg, facts_mod.summary_lines(fx), question)
     name, completed, last = agent.run_agent(cfg, run, prompt)
     if not name:
-        return {"verdict": "UNSOLVED", "detail": "no usable agent: " + last}
+        # A killed or failed agent can leave half-finished edits, and the nightly commits whatever is
+        # uncommitted as "live drift". Revert them, and keep the diff in the run so no work is lost.
+        if agent.changed_files(cfg):
+            (run.dir / "unfinished.diff").write_text(agent.diff_text(cfg))
+            agent.revert(cfg, run)
+            last += "; its unfinished edits were reverted (kept in %s)" % (run.dir / "unfinished.diff")
+        return {"verdict": "UNSOLVED", "detail": "the agent did not finish: " + last}
     word = next((w for w in ("FIXED", "BLOCKED", "UNSOLVED") if last.startswith(w)), None)
     detail = last.split(" ", 1)[1].strip() if word and " " in last else last
     if not agent.changed_files(cfg):
@@ -664,18 +710,28 @@ def pipeline(cfg: nix.Config, run: Run, *, switch_policy: str, do_bump: bool, on
             verdict = fix_loop(cfg, run, fx, verdict, max_attempts, eval_only=eval_only)
             if verdict.ok:
                 commit_drift(cfg, run, "fix: " + (verdict.failed_step or "build") + " (agent)")
-    act = activate(cfg, run, fx, verdict, switch_policy, do_review=True)
+    # Scanned before activation, so a proven fix for something exploited in the wild goes live this run.
     sec = security.report(cfg, fx)
+    cvefix = {"attempted": False, "fixed": False, "reason": "skipped", "held": []}
     if not eval_only and verdict.ok and security.cve_due() and not run.expired():
         targets = [p for p in (verdict.system_path, verdict.hm_path) if p]
         if targets:
-            sec["cve"] = security.cve_scan(cfg, run, targets)
+            sec["cve"] = security.cve_scan(cfg, run, targets, sec["eval"].get("values"))
+            if not run.expired():
+                cvefix = cve_remediate(cfg, run, fx, sec["cve"], max_attempts)
+                verdict = cvefix.pop("verdict", None) or verdict
+    act = activate(cfg, run, fx, verdict, switch_policy, do_review=True)
     sec["auto_fix"] = secfix
+    sec["cve_fix"] = cvefix
     sec["summary"] = security.summary_lines(sec)
     if secfix["attempted"]:
         sec["summary"].insert(1, "security auto-fix: " + secfix["reason"])
     elif secfix.get("held"):
         sec["summary"].insert(1, "security auto-fix held: " + "; ".join(secfix["held"])[:200])
+    if cvefix["attempted"]:
+        sec["summary"].insert(1, "exploited-in-the-wild fix: " + cvefix["reason"])
+    elif cvefix.get("held"):
+        sec["summary"].insert(1, "exploited-in-the-wild fix held: " + "; ".join(cvefix["held"])[:200])
     (run.dir / "security.json").write_text(json.dumps(sec, indent=2, default=str))
     security.escalate(sec)
     for line in sec["summary"][:2]:

@@ -272,7 +272,7 @@ def cmd_security(args) -> int:
         from .store import lock, new_run
         with lock():
             run = new_run("security")
-            rep["cve"] = security.cve_scan(cfg, run, security.scan_targets(cfg))
+            rep["cve"] = security.cve_scan(cfg, run, security.scan_targets(cfg), rep["eval"].get("values"))
             run.verdict = {"ok": True, "summary": "security scan"}
             run.write_report()
         rep["summary"] = security.summary_lines(rep)
@@ -402,7 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("security", help="what grants privilege, exposes a credential, or is known-vulnerable?")
     s.add_argument("--json", action="store_true")
     s.add_argument("--fix", action="store_true", help="let the agent pin unhashed remote fetches — the only class ihc will hand to an agent, and never from the nightly run")
-    s.add_argument("--cve", action="store_true", help="also scan the live closure with vulnix (needs network; minutes on a cold cache)")
+    s.add_argument("--cve", action="store_true", help="also scan the live closure for CVEs and mark the ones exploited in the wild (needs network; minutes)")
     s.add_argument("--max-attempts", type=int, default=3)
     s.set_defaults(fn=cmd_security)
 
