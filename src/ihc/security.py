@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import docs, facts as facts_mod, nix
-from .store import STATE_DIR, Run, pending_add, pending_list
+from .store import STATE_DIR, Run, cve_cleared, pending_add, pending_list
 
 # One batched `nix eval --apply` over the whole configuration. Pure builtins (no `lib`), so it is
 # identical on nixos and nix-darwin; no import-from-derivation, no store writes.
@@ -1007,11 +1007,29 @@ def tier(pkg: dict) -> str | None:
     return "mitigate" if pkg.get("exposure") == "reachable" else "upgrade"
 
 
+def cve_key(p: dict) -> str:
+    return "cve:%s:%s" % (p["pname"], ",".join(p["kev"]))
+
+
+CVE_VERDICT_RE = re.compile(r"IHC-CVE\s+(\S+)\s+(FIXED|NOT-AFFECTED|OPEN)\b[:\s]*(.*)")
+
+
+def cve_verdicts(text: str) -> dict[str, tuple[str, str]]:
+    """The agent's `IHC-CVE <build> FIXED|NOT-AFFECTED|OPEN <evidence>` lines. Two builds can share a
+    name, so an OPEN line for a name wins over any other; otherwise the last line wins."""
+    out: dict[str, tuple[str, str]] = {}
+    for m in CVE_VERDICT_RE.finditer(text):
+        build = m.group(1).strip("`")
+        if out.get(build, ("",))[0] != "OPEN":
+            out[build] = (m.group(2), m.group(3).strip().strip("`")[:300])
+    return out
+
+
 def cve_task(pkgs: list[dict]) -> str:
     """The task text for `run.fix_loop` for the packages `tier` selected."""
     rows = ["- %s (built as %s; tier %s; exposure %s%s):\n    %s" % (
         p["pname"], p["name"], p["tier"], p["exposure"], " via " + ", ".join(p["sockets"]) if p.get("sockets") else "",
-        "\n    ".join(p.get("kev_notes") or p["kev"])) for p in pkgs]
+        "\n    ".join(p.get("kev_notes") or p["kev"])) for p in {p["name"]: p for p in pkgs}.values()]
     return "\n".join([
         "CISA lists these vulnerabilities as exploited in the wild, and this configuration builds a version "
         "of the package that a scanner matched to them:", *rows,
@@ -1030,6 +1048,11 @@ def cve_task(pkgs: list[dict]) -> str:
         "service. Never touch ssh or its port: a remote lockout is worse than the vulnerability. Put a comment "
         "on the change that names the CVE, so it can be undone when nixpkgs ships the fix.",
         "Change nothing that GOALS.md lists as an invariant. Prove it by evaluating both attributes.",
+        "Before the final line, print one line for each build above, exactly one of: "
+        "`IHC-CVE <build name> FIXED <what you changed>`, `IHC-CVE <build name> NOT-AFFECTED <evidence>`, "
+        "`IHC-CVE <build name> OPEN <why it stays vulnerable>`. ihc closes a build only on its own line, "
+        "and a FIXED line only if the proof passes. If several builds share a name and any of them stays "
+        "vulnerable, that name is OPEN.",
     ])
 
 
@@ -1075,6 +1098,10 @@ def cve_scan(cfg: nix.Config, run: Run, targets: list[Path], probe_values: dict 
         excepted = docs.security_exceptions(cfg.docs_dir)
         for p in packages:
             p["kev"] = sorted(c for c in p["cves"] if c in (kev or {}) and c not in excepted)
+            # ponytail: closed by build name, so a fix undone later under the same name is not flagged again
+            why = cve_cleared(cve_key(p), p["name"]) if p["kev"] else None
+            if why:
+                p["kev"], p["cleared"] = [], why
             p["kev_notes"] = ["%s (CISA added %s): %s. %s" % (c, kev[c].get("dateAdded"), kev[c].get("vulnerabilityName"),
                                                                (kev[c].get("shortDescription") or "")[:300]) for c in p["kev"]]
         measured = any(p["kev"] for p in packages)

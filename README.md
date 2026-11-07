@@ -170,8 +170,8 @@ Resolve with `ihc pending resolve <id>` after you acted.
 
 - **Store pressure**: `/nix/store` free space below `IHC_MIN_STORE_FREE_GIB` (default 10 GiB)
   drops every proof to `nix eval` only — options and packages still get verified, but nothing is
-  downloaded, built, or activated. `/boot` free space below 2x the current kernel+initrd size
-  blocks *system* activation only, after a stale boot-entry prune is tried first.
+  downloaded, built, or activated. `/boot` free space below 1.25x the current kernel+initrd size
+  blocks *system* activation only, after ihc prunes stale boot entries, then system generations older than `IHC_GC_KEEP_DAYS`.
 - **switch vs. boot**: activation mode is `boot` (applies at next reboot, current session
   untouched) instead of `switch` when the kernel, initrd, kernel modules, or a hardcoded GPU
   driver binary changed, or when dry-activate says a unit in the mined guarded-units list (your
@@ -374,7 +374,11 @@ reached. That sets how far the agent may go:
 | yes | yes | do the same; only if no fixed build exists, also close the exposure (bind to localhost, close the port, or as the last resort stop the service), with a comment naming the CVE. Never ssh |
 
 The agent first checks whether the build is really affected — the match is by name and version — and
-changes nothing if it is not. The three gates above apply, and a CVE id listed under
+changes nothing if it is not. It ends with one verdict per build (fixed, not affected, or open); a
+build it fixed or found not affected is closed and never reported again under that build name, and
+only the builds it names are closed. A fix that would force more than `IHC_HEAVY_MINUTES` of local
+builds is reverted and held like a failed one; `ihc run --allow-heavy` lets it through. The three
+gates above apply, and a CVE id listed under
 `## Security exceptions` is never acted on. A mitigation stays in your pending list after it lands,
 because it changed what the system does. Exposure is measured on Linux with `sudo -n`; trusted
 interfaces and ports that docker publishes past the firewall are not counted.
@@ -385,7 +389,8 @@ interfaces and ports that docker publishes past the firewall are not counted.
 keep the built system/home out-links that pin closures) and mines the rest for the docs:
 generation retention, unused flake inputs, commit-pinned inputs, local inputs whose content
 changed, configuration assets outside git, stale backup files, dead configuration files, and
-`/boot` pressure (it re-installs the bootloader to drop entries of deleted generations).
+`/boot` pressure (it re-installs the bootloader to drop entries of deleted generations, and if
+that is not enough, deletes system generations older than `IHC_GC_KEEP_DAYS`).
 MAINTENANCE.md's "System hygiene" section is the method the agent maintains for the host.
 
 ### Garbage collection

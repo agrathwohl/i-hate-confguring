@@ -112,7 +112,7 @@ def commit_drift(cfg: nix.Config, run: Run, msg: str) -> list[str]:
 
 # ---- fix loop -------------------------------------------------------------------
 
-def fix_loop(cfg: nix.Config, run: Run, fx: dict, verdict: prove.Verdict, max_attempts: int, task: str | None = None, target: str = "all", eval_only: bool = False) -> prove.Verdict:
+def fix_loop(cfg: nix.Config, run: Run, fx: dict, verdict: prove.Verdict, max_attempts: int, task: str | None = None, target: str = "all", eval_only: bool = False, allow_heavy: bool = True) -> prove.Verdict:
     summary = facts_mod.summary_lines(fx)
     if eval_only:
         summary = summary + ["DISK IS NEARLY FULL: verify with `nix eval --raw <attr>.drvPath` only; do NOT run nix build or home-manager build"]
@@ -143,6 +143,12 @@ def fix_loop(cfg: nix.Config, run: Run, fx: dict, verdict: prove.Verdict, max_at
                 break
             continue
         (run.dir / ("fix-%d.diff" % attempt)).write_text(diff)
+        heavy = [] if allow_heavy or eval_only else heavy_builds(cfg, run)
+        if heavy:
+            agent.revert(cfg, run)
+            what = ", ".join("%s (%d min)" % (n, secs // 60) for n, secs in heavy)
+            run.note("fix by %s needs local builds of %s; reverted" % (name, what))
+            return prove.Verdict(ok=False, failed_step="heavy", failed_target=what)
         verdict = prove.check(cfg, run, fx, target, eval_only)
         if verdict.ok:
             run.note("fixed by %s on attempt %d: %s" % (name, attempt, last[:200]))
@@ -473,10 +479,14 @@ def security_fix(cfg: nix.Config, run: Run, fx: dict, max_attempts: int) -> dict
     return out
 
 
-def _prove_fix(cfg: nix.Config, run: Run, fx: dict, task: str, keys: list[str], what: str, max_attempts: int) -> tuple[bool, str, prove.Verdict]:
+def _prove_fix(cfg: nix.Config, run: Run, fx: dict, task: str, keys: list[str], what: str, max_attempts: int, allow_heavy: bool = True) -> tuple[bool, str, prove.Verdict]:
     """One gated security task through the agent and the proof; kept only if it proves."""
     verdict = fix_loop(cfg, run, fx, prove.Verdict(ok=False, failed_step="security", failed_target="all"),
-                       max_attempts, task, "all", False)
+                       max_attempts, task, "all", False, allow_heavy=allow_heavy)
+    if verdict.failed_step == "heavy":
+        for k in keys:
+            store.security_attempted(k, False)
+        return False, "held: the fix needs local builds of %s; `ihc run --allow-heavy` lets it through" % verdict.failed_target, verdict
     changed = bool(agent.changed_files(cfg))
     fixed = bool(verdict.ok and changed)
     for k in keys:
@@ -490,35 +500,54 @@ def _prove_fix(cfg: nix.Config, run: Run, fx: dict, task: str, keys: list[str], 
     return False, "the agent changed nothing (it may have judged the finding deliberate, or the build not affected)", verdict
 
 
-def cve_key(p: dict) -> str:
-    return "cve:%s:%s" % (p["pname"], ",".join(p["kev"]))
-
-
-def cve_remediate(cfg: nix.Config, run: Run, fx: dict, cve: dict | None, max_attempts: int) -> dict:
+def cve_remediate(cfg: nix.Config, run: Run, fx: dict, cve: dict | None, max_attempts: int, allow_heavy: bool = False) -> dict:
     """Act on the packages the scan marked as exploited in the wild, only as far as `security.tier`
-    allows, behind the same gates as security_fix. A proven fix's verdict is returned for activation."""
+    allows, behind the same gates as security_fix. Each build is closed only by the agent's own verdict
+    on it. A proven fix's verdict is returned for activation."""
     out: dict = {"attempted": False, "fixed": False, "reason": "", "held": []}
-    due, seen = [], set()
+    groups: dict[str, list[dict]] = {}
     for p in (cve or {}).get("packages") or []:
+        if p.get("tier"):
+            groups.setdefault(security.cve_key(p), []).append(p)
+    due: dict[str, list[dict]] = {}
+    for k, ps in groups.items():
         # one gate check per key: a second record of the same package would pass the first-sighting gate
-        if not p.get("tier") or cve_key(p) in seen:
-            continue
-        seen.add(cve_key(p))
-        ok, why = store.security_due(cve_key(p), SECURITY_GRACE_DAYS, SECURITY_BACKOFF_DAYS)
-        (due if ok else out["held"]).append(p if ok else "%s %s: %s" % (p["pname"], ",".join(p["kev"]), why))
+        ok, why = store.security_due(k, SECURITY_GRACE_DAYS, SECURITY_BACKOFF_DAYS)
+        if ok:
+            due[k] = ps
+        else:
+            out["held"].append("%s %s: %s" % (ps[0]["pname"], ",".join(ps[0]["kev"]), why))
     if out["held"]:
         run.note("exploited-in-the-wild fix held: " + "; ".join(out["held"])[:400])
     if not due:
         out["reason"] = "nothing due"
         return out
     out["attempted"] = True
-    what = ", ".join("%s (%s)" % (p["pname"], ",".join(p["kev"])) for p in due)
-    run.note("exploited-in-the-wild fix (%s): %s" % ("/".join(sorted({p["tier"] for p in due})), what))
-    out["fixed"], out["reason"], verdict = _prove_fix(cfg, run, fx, security.cve_task(due), [cve_key(p) for p in due], what, max_attempts)
-    for p in due:
-        p["fix"] = out["reason"]
-        # a mitigation changed what the system does, so it stays in front of the user
-        p["remedied"] = out["fixed"] and p["tier"] == "upgrade"
+    pkgs = [p for ps in due.values() for p in ps]
+    what = ", ".join("%s (%s)" % (ps[0]["pname"], ",".join(ps[0]["kev"])) for ps in due.values())
+    run.note("exploited-in-the-wild fix (%s): %s" % ("/".join(sorted({p["tier"] for p in pkgs})), what))
+    first = len(run.steps)
+    out["fixed"], why, verdict = _prove_fix(cfg, run, fx, security.cve_task(pkgs), [], what, max_attempts, allow_heavy)
+    said = security.cve_verdicts("\n".join(s.out for s in run.steps[first:] if s.name.startswith("agent-")))
+    outcome: dict[str, set] = {}
+    for k, ps in due.items():
+        cleared = {}
+        for p in ps:
+            word, because = said.get(p["name"], ("", ""))
+            ok = word == "NOT-AFFECTED" or (word == "FIXED" and out["fixed"])
+            if ok or word == "OPEN":
+                p["fix"] = "%s: %s" % (word.lower().replace("-", " "), because)
+            else:
+                p["fix"] = "open: the agent gave no verdict for this build" if out["fixed"] else why
+            # a mitigation changed what the system does, so it stays in front of the user
+            p["remedied"] = ok and (word == "NOT-AFFECTED" or p["tier"] == "upgrade")
+            if p["remedied"]:
+                cleared[p["name"]] = p["fix"]
+            outcome.setdefault(word.lower().replace("-", " ") if ok else "open", set()).add(p["name"])
+        store.security_attempted(k, out["fixed"], cleared)
+    out["reason"] = "; ".join("%s: %s" % (w, ", ".join(sorted(ns))) for w, ns in outcome.items())
+    if "open" in outcome and not out["fixed"]:
+        out["reason"] += " (%s)" % why
     if out["fixed"]:
         out["verdict"] = verdict
     run.note("exploited-in-the-wild fix: " + out["reason"])
@@ -528,6 +557,19 @@ def cve_remediate(cfg: nix.Config, run: Run, fx: dict, cve: dict | None, max_att
 # ---- garbage collection --------------------------------------------------------
 
 GC_KEEP_DAYS = int(os.environ.get("IHC_GC_KEEP_DAYS", "14"))
+
+
+def free_boot(cfg: nix.Config, run: Run, fx: dict) -> dict:
+    """Drop boot entries of deleted generations; if /boot is still short, delete system generations
+    older than GC_KEEP_DAYS (the same bound as collect_garbage) and drop their entries. Fresh facts."""
+    prove.prune_boot(cfg, run, fx)
+    fx = facts_mod.mine(cfg)
+    if prove.boot_short(fx) and cfg.platform == "nixos" and prove.sudo_ok(cfg):
+        run.step("boot-old-generations", ["nix-env", "-p", "/nix/var/nix/profiles/system", "--delete-generations", "%dd" % GC_KEEP_DAYS], sudo=True)
+        fx = facts_mod.mine(cfg)
+        prove.prune_boot(cfg, run, fx)
+        fx = facts_mod.mine(cfg)
+    return fx
 
 
 def stale_profile_links(limit: int = 12) -> list[dict]:
@@ -684,11 +726,11 @@ def pipeline(cfg: nix.Config, run: Run, *, switch_policy: str, do_bump: bool, on
     pending_before = len(pending_list())
     run.note("adopt: " + "; ".join(adopt(cfg, run, fx)))
     if prove.boot_short(fx):
-        prove.prune_boot(cfg, run, fx)
-        fx = facts_mod.mine(cfg)
+        fx = free_boot(cfg, run, fx)
         if prove.boot_short(fx):
             d = fx["runtime"]["disk"]
-            msg = "/boot has %.0f MiB free; a generation needs ~%.0f MiB. System activation is disabled until /boot has room (lower boot.loader.systemd-boot.configurationLimit or grow /boot)." % (d["boot"]["free_gib"] * 1024, d["boot_need_mib"])
+            msg = "/boot has %.0f MiB free; ihc needs %.0f MiB (%.2fx a kernel and initrd of ~%.0f MiB). System activation is disabled until /boot has room (remove old system profiles, lower boot.loader.systemd-boot.configurationLimit, or grow /boot)." % (
+                d["boot"]["free_gib"] * 1024, d["boot_need_mib"] * prove.BOOT_MULTIPLIER, prove.BOOT_MULTIPLIER, d["boot_need_mib"])
             run.note(msg)
             notify("/boot is full", msg, "critical")
             if switch_policy in ("auto", "system-only"):
@@ -718,7 +760,7 @@ def pipeline(cfg: nix.Config, run: Run, *, switch_policy: str, do_bump: bool, on
         if targets:
             sec["cve"] = security.cve_scan(cfg, run, targets, sec["eval"].get("values"))
             if not run.expired():
-                cvefix = cve_remediate(cfg, run, fx, sec["cve"], max_attempts)
+                cvefix = cve_remediate(cfg, run, fx, sec["cve"], max_attempts, allow_heavy)
                 verdict = cvefix.pop("verdict", None) or verdict
     act = activate(cfg, run, fx, verdict, switch_policy, do_review=True)
     sec["auto_fix"] = secfix

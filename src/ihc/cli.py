@@ -138,15 +138,14 @@ def cmd_ask(args) -> int:
 
 def cmd_switch(args) -> int:
     from . import facts, prove
-    from .run import activate
+    from .run import activate, free_boot
     from .store import lock, new_run
     cfg = _cfg(args)
     with lock():
         run = new_run("switch")
         fx = facts.mine(cfg)
         if prove.boot_short(fx):
-            prove.prune_boot(cfg, run, fx)
-            fx = facts.mine(cfg)
+            fx = free_boot(cfg, run, fx)
         v = prove.check(cfg, run, fx, args.target)
         act = {}
         if v.ok:

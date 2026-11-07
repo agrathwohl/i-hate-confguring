@@ -15,7 +15,7 @@ from . import aesthetics, nix
 from .store import Run, Step
 
 MIN_STORE_FREE_GIB = float(os.environ.get("IHC_MIN_STORE_FREE_GIB", "10"))
-BOOT_MULTIPLIER = 2.0
+BOOT_MULTIPLIER = 1.25
 HM_BACKUP_EXT = "ihc-bak"
 
 

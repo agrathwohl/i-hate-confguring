@@ -190,6 +190,45 @@ class FixLoopWritesDiffTests(unittest.TestCase):
                 self.assertTrue(v.ok)
                 self.assertTrue((run.dir / "fix-1.diff").exists())
 
+    def test_a_fix_that_forces_heavy_builds_is_reverted_before_any_build(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+        from ihc import agent, nix, prove, run as runmod, store
+        with tempfile.TemporaryDirectory() as d:
+            cfg = nix.Config("nixos", Path(d), "h", None, None, True, [], [], "h", "u", Path(d))
+            with patch.object(store, "RUNS_DIR", Path(d) / "runs"), patch.object(store, "STATE_DIR", Path(d)), patch.object(store, "PENDING_DIR", Path(d) / "p"):
+                run = store.new_run("t")
+                check, revert = MagicMock(), MagicMock()
+                with patch.object(agent, "run_agent", return_value=("claude", True, "IHC-DONE: x")), \
+                     patch.object(agent, "diff_text", return_value="+++ b/x.nix\n+ foo = 1;\n"), \
+                     patch.object(agent, "changed_files", return_value=["x.nix"]), \
+                     patch.object(agent, "revert", revert), \
+                     patch.object(runmod, "heavy_builds", return_value=[("ruby", 1800)]), \
+                     patch.object(prove, "check", check):
+                    fx = {"host": "h", "platform": "nixos", "config": {"flake_dir": d, "host_attr": "h", "hm_attr": None, "impure": True, "nix_args": []}}
+                    v = runmod.fix_loop(cfg, run, fx, prove.Verdict(ok=False, failed_step="security"), 2, "task", allow_heavy=False)
+                self.assertEqual((v.ok, v.failed_step, v.failed_target), (False, "heavy", "ruby (30 min)"))
+                check.assert_not_called()
+                revert.assert_called_once()
+
+
+class FreeBootTests(unittest.TestCase):
+    def _free(self, short):
+        from unittest.mock import MagicMock, patch
+        from ihc import nix, prove, run as runmod
+        cfg, run = nix.Config("nixos", Path("/x"), "h", None, None, True, [], [], "h", "u", Path("/x")), MagicMock()
+        with patch.object(prove, "prune_boot") as prune, patch.object(runmod.facts_mod, "mine", return_value={}), \
+             patch.object(prove, "boot_short", side_effect=short), patch.object(prove, "sudo_ok", return_value=True):
+            runmod.free_boot(cfg, run, {})
+        return run.step.call_args_list, prune.call_count
+
+    def test_old_generations_go_only_when_the_prune_was_not_enough(self):
+        self.assertEqual(self._free([False]), ([], 1))
+        steps, prunes = self._free([True])
+        self.assertEqual(steps[0].args[1], ["nix-env", "-p", "/nix/var/nix/profiles/system", "--delete-generations", "14d"])
+        self.assertEqual((steps[0].kwargs, prunes), ({"sudo": True}, 2))
+
 
 class EscalationTests(unittest.TestCase):
     def test_third_consecutive_block_becomes_pending(self):

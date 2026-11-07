@@ -116,13 +116,20 @@ def security_due(key: str, grace_days: int, backoff_days: int) -> tuple[bool, st
     return True, ""
 
 
-def security_attempted(key: str, ok: bool) -> None:
+def security_attempted(key: str, ok: bool, cleared: dict[str, str] | None = None) -> None:
+    """`cleared`: build name -> why the agent closed it (fixed, or not affected); scans skip those builds."""
     data = _sec_state()
     entry = data.setdefault(key, {"first_seen": now_iso(), "attempts": 0, "last_attempt": None})
     entry["attempts"] = int(entry.get("attempts", 0)) + 1
     entry["last_attempt"] = now_iso()
     entry["outcome"] = "fixed" if ok else "failed"
+    if cleared:
+        entry.setdefault("cleared", {}).update(cleared)
     _sec_write(data)
+
+
+def cve_cleared(key: str, build: str) -> str | None:
+    return ((_sec_state().get(key) or {}).get("cleared") or {}).get(build)
 
 
 def heavy_deferred(name: str) -> int:

@@ -645,7 +645,7 @@ class CveScanWiringTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="ihc-security-cvescan-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         for mod, name, value in ((store, "STATE_DIR", self.tmp), (store, "RUNS_DIR", self.tmp / "runs"),
-                                 (store, "PENDING_DIR", self.tmp / "pending"),
+                                 (store, "PENDING_DIR", self.tmp / "pending"), (store, "SECURITY_STATE", self.tmp / "s.json"),
                                  (security, "STATE_DIR", self.tmp), (security, "CVE_CACHE", self.tmp / "vulnix-cache")):
             p = mock.patch.object(mod, name, value)
             p.start()
@@ -686,6 +686,14 @@ class CveScanWiringTests(unittest.TestCase):
         self.assertEqual([p["kev"] for p in out["packages"]], [[], []])
         self.assertEqual(out["counts"]["exploited"], 0)
 
+    def test_a_build_an_agent_closed_is_not_flagged_again_but_a_new_build_is(self):
+        store.security_attempted("cve:php:CVE-K", False, {"php-8.5.12": "not affected: other product"})
+        out = self.scan(self.TWO, kev=(self.KEV, "CISA KEV x, 1 entries"))
+        php = next(p for p in out["packages"] if p["pname"] == "php")
+        self.assertEqual((php["kev"], php["cleared"]), ([], "not affected: other product"))
+        store.security_attempted("cve:php:CVE-K", False, {"php-8.5.11": "fixed"})
+        self.assertEqual(store.cve_cleared("cve:php:CVE-K", "php-8.5.13"), None)
+
     def test_a_failed_kev_download_is_a_failure_never_nothing_exploited(self):
         out = self.scan(self.TWO, kev=(None, "the CISA KEV download failed: 404"))
         self.assertEqual(out["kev"], {"ok": False, "note": "the CISA KEV download failed: 404"})
@@ -713,7 +721,8 @@ class PipelineSecurityWiringTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="ihc-security-pipeline-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         for name, value in (("STATE_DIR", self.tmp), ("RUNS_DIR", self.tmp / "runs"),
-                            ("PENDING_DIR", self.tmp / "pending"), ("HISTORY", self.tmp / "history.jsonl")):
+                            ("PENDING_DIR", self.tmp / "pending"), ("HISTORY", self.tmp / "history.jsonl"),
+                            ("SECURITY_STATE", self.tmp / "security-state.json")):
             p = mock.patch.object(store, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -1005,17 +1014,24 @@ class ExploitedEscalationTests(unittest.TestCase):
 class CveRemediateTests(unittest.TestCase):
     """run.cve_remediate: only tiered, due packages reach the agent; a mitigation stays escalated."""
 
-    def _run(self, packages, due, verdict_ok=True, changed=True):
+    def _run(self, packages, due, verdict_ok=True, changed=True, said="", failed_step=None):
         from ihc import agent, prove, run as run_mod
         seen = {}
+
+        def fix_loop(cfg, run, fx, verdict, max_attempts, task=None, target="all", eval_only=False, allow_heavy=True):
+            seen.setdefault("task", task)
+            seen["allow_heavy"] = allow_heavy
+            run.step("agent-claude", [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", said])
+            return prove.Verdict(ok=verdict_ok, system_path="/nix/store/x", failed_step=failed_step, failed_target="ruby (30 min)")
+
         with tempfile.TemporaryDirectory() as d:
             cfg = nix.Config("nixos", Path(d), "h", "u", None, True, [], [], "h", "u", Path(d))
             gate = run_mod.store.security_due if due is None else (lambda k, g, b: (k in due, "first sighting"))
             with mock.patch.object(store, "RUNS_DIR", Path(d) / "runs"), mock.patch.object(store, "STATE_DIR", Path(d)), \
                  mock.patch.object(store, "SECURITY_STATE", Path(d) / "s.json"), \
                  mock.patch.object(run_mod.store, "security_due", gate), \
-                 mock.patch.object(run_mod.store, "security_attempted", lambda k, ok: seen.__setitem__(k, ok)), \
-                 mock.patch.object(run_mod, "fix_loop", lambda *a, **k: seen.setdefault("task", a[5]) and prove.Verdict(ok=verdict_ok, system_path="/nix/store/x")), \
+                 mock.patch.object(run_mod.store, "security_attempted", lambda k, ok, cleared=None: seen.__setitem__(k, (ok, cleared))), \
+                 mock.patch.object(run_mod, "fix_loop", fix_loop), \
                  mock.patch.object(agent, "changed_files", lambda c: ["a.nix"] if changed else []), \
                  mock.patch.object(agent, "revert", lambda c, r: seen.__setitem__("reverted", True)), \
                  mock.patch.object(run_mod, "commit_drift", lambda *a, **k: []):
@@ -1043,17 +1059,48 @@ class CveRemediateTests(unittest.TestCase):
 
     def test_a_proven_upgrade_is_activated_and_closed(self):
         p = self.pkg("upgrade")
-        out, seen = self._run([p], {"cve:php:CVE-K"})
+        out, seen = self._run([p], {"cve:php:CVE-K"}, said="IHC-CVE php-8.5.12 FIXED patched\nIHC-DONE: FIXED x")
         self.assertTrue(out["fixed"])
         self.assertEqual(out["verdict"].system_path, "/nix/store/x")
-        self.assertIs(seen["cve:php:CVE-K"], True)
+        self.assertEqual(seen["cve:php:CVE-K"], (True, {"php-8.5.12": "fixed: patched"}))
         self.assertTrue(p["remedied"])
 
     def test_a_proven_mitigation_stays_in_front_of_the_user(self):
         p = self.pkg("mitigate", exposure="reachable")
-        out, _ = self._run([p], {"cve:php:CVE-K"})
+        out, seen = self._run([p], {"cve:php:CVE-K"}, said="IHC-CVE php-8.5.12 FIXED bound to localhost")
         self.assertTrue(out["fixed"])
         self.assertFalse(p["remedied"])
+        self.assertEqual(seen["cve:php:CVE-K"], (True, {}))
+
+    def test_only_the_builds_the_agent_names_are_closed(self):
+        php, nav = self.pkg("upgrade"), self.pkg("upgrade", pname="navigator", name="navigator-1.1-tex", kev=["CVE-L"])
+        out, seen = self._run([php, nav], {"cve:php:CVE-K", "cve:navigator:CVE-L"}, said="IHC-CVE php-8.5.12 FIXED patched")
+        self.assertTrue(php["remedied"])
+        self.assertFalse(nav["remedied"])
+        self.assertEqual(seen["cve:navigator:CVE-L"], (True, {}))
+        self.assertIn("open: navigator-1.1-tex", out["reason"])
+        self.assertEqual(nav["fix"], "open: the agent gave no verdict for this build")
+
+    def test_a_build_the_agent_finds_not_affected_is_closed_without_a_change(self):
+        nav = self.pkg("upgrade", pname="navigator", name="navigator-1.1-tex", kev=["CVE-L"])
+        out, seen = self._run([nav], {"cve:navigator:CVE-L"}, verdict_ok=False, changed=False,
+                              said="- IHC-CVE `navigator-1.1-tex` NOT-AFFECTED NVD lists siemens:navigator only")
+        self.assertFalse(out["fixed"])
+        self.assertTrue(nav["remedied"])
+        self.assertEqual(seen["cve:navigator:CVE-L"], (False, {"navigator-1.1-tex": "not affected: NVD lists siemens:navigator only"}))
+
+    def test_an_open_line_wins_for_a_name_two_builds_share(self):
+        for said in ("IHC-CVE b-1.2 FIXED swap\nIHC-CVE b-1.2 OPEN wheel", "IHC-CVE b-1.2 OPEN wheel\nIHC-CVE b-1.2 FIXED swap"):
+            self.assertEqual(security.cve_verdicts(said)["b-1.2"], ("OPEN", "wheel"))
+
+    def test_a_fix_with_heavy_local_builds_is_held(self):
+        p = self.pkg("upgrade", pname="ruby", name="ruby-3.3.10")
+        out, seen = self._run([p], {"cve:ruby:CVE-K"}, verdict_ok=False, changed=False, failed_step="heavy",
+                              said="IHC-CVE ruby-3.3.10 FIXED patched")
+        self.assertIs(seen["allow_heavy"], False)
+        self.assertFalse(out["fixed"])
+        self.assertFalse(p["remedied"])
+        self.assertIn("--allow-heavy", p["fix"])
 
     def test_a_failed_proof_reverts_and_is_not_activated(self):
         out, seen = self._run([self.pkg("upgrade")], {"cve:php:CVE-K"}, verdict_ok=False)
